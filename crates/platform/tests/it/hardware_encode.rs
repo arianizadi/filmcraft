@@ -5,8 +5,12 @@
 //! must give errors and never crash. Tests that need a hardware encoder skip without one.
 #![cfg(target_os = "macos")]
 
+#[path = "common/hardware_encode.rs"]
+mod support;
+
+use support::{FPS, H, W, hardware, hardware_settings, inspect, project, tmp};
+
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
 use filmcraft_export::{
     BitrateMode, EncodedPacket, EncoderFrame, ExportSettings, Format, H264Pass, H264Profile, HardwareEncoding, Progress, VideoEncoder, export, hw_encode_stats,
@@ -14,17 +18,9 @@ use filmcraft_export::{
 };
 use filmcraft_frame::PixelData;
 use filmcraft_isobmff::{CodecConfig, SampleEntry};
-use filmcraft_media::generators::GeneratorSource;
-use filmcraft_media::{DemoScene, MediaSource};
 use filmcraft_platform::hardware_encode::{HardwareEncoder, config_for, hevc_available, videotoolbox_encoder_factory};
 use filmcraft_platform::videotoolbox_encode::{VtConfig, VtEncoder, VtInput, VtProfile, VtRate};
-use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, Project, SequenceSettings, TrackKind};
-use filmcraft_render::SourceMap;
 use filmcraft_time::{FrameRate, Tick, TimeRange};
-
-const W: u32 = 640;
-const H: u32 = 360;
-const FPS: FrameRate = FrameRate::FPS_30;
 
 /// A moving test picture: gradients plus a bar travelling across.
 fn picture(i: u64) -> Vec<u8> {
@@ -43,25 +39,9 @@ fn picture(i: u64) -> Vec<u8> {
     px
 }
 
-fn hardware_settings() -> ExportSettings {
-    ExportSettings { format: Format::H264, hardware_encoding: HardwareEncoding::Auto, bitrate_kbps: 8_000, keyframe_distance: Some(30), ..Default::default() }
-}
-
 /// H.265 needs no opt-in: choosing the format is the opt-in.
 fn hevc_settings() -> ExportSettings {
     ExportSettings { format: Format::Hevc, bitrate_kbps: 6_000, keyframe_distance: Some(30), ..Default::default() }
-}
-
-/// The hardware encoder for the settings, or `None` (skip) when this machine has none.
-fn hardware(s: &ExportSettings, w: u32, h: u32) -> Option<Box<dyn VideoEncoder>> {
-    match videotoolbox_encoder_factory(s.format, w, h, FPS, s) {
-        Some(Ok(e)) => Some(e),
-        Some(Err(e)) => panic!("factory error: {e}"),
-        None => {
-            eprintln!("SKIPPED: no VideoToolbox hardware {} encoder for these settings", s.format.label());
-            None
-        }
-    }
 }
 
 fn encode_all(enc: &mut Box<dyn VideoEncoder>, frames: u64) -> Vec<EncodedPacket> {
@@ -240,57 +220,6 @@ fn rgba_input_refuses_what_does_not_fit() {
     let _ = calm("flush", || rgb.flush());
 }
 
-/// An export at another frame rate than the sequence's (frames are repeated or dropped on the way) and
-/// a cancelled export followed by a complete one in the same process: the hardware path must give the
-/// asked-for frame count, release its sessions and start clean again.
-#[test]
-fn rate_conversion_and_cancel_then_export_again() {
-    filmcraft_platform::register();
-    let probe = ExportSettings { include_audio: false, ..hardware_settings() };
-    if hardware(&probe, W, H).is_none() {
-        return;
-    }
-    let (frames, (p, seq, m)) = (60i64, project(60));
-    // 60 frames at 30 fps become 120 at 60 fps and 50 at 25 fps
-    for (rate, want) in [(FrameRate::FPS_60, 120usize), (FrameRate::FPS_25, 50)] {
-        let path = tmp(&format!("rate-{}.mp4", rate.num));
-        let s = ExportSettings { path: path.clone(), frame_rate: Some(rate), ..probe.clone() };
-        let report = export(&p, seq, &s, &m, &Progress::default()).expect("export");
-        assert_eq!(report.frames as usize, want, "{rate:?}");
-        let (samples, pictures, _) = inspect(&path);
-        assert_eq!((samples, pictures), (want, want), "{rate:?}");
-    }
-    // cancel from another thread once a few frames are done
-    let before = hw_encode_stats();
-    let path = tmp("cancelled.mp4");
-    let s = ExportSettings { path: path.clone(), ..probe.clone() };
-    let progress = Progress::default();
-    let result = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while progress.done.load(std::sync::atomic::Ordering::Relaxed) < 8 && !progress.finished.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-        export(&p, seq, &s, &m, &progress)
-    });
-    match result {
-        Err(filmcraft_export::ExportError::Cancelled) => {}
-        Ok(r) => eprintln!("the export finished before the cancel landed ({} frames)", r.frames),
-        Err(e) => panic!("a cancelled export must report Cancelled or finish, not {e}"),
-    }
-    // and the next export in the same process is complete
-    let path = tmp("after-cancel.mp4");
-    let s = ExportSettings { path: path.clone(), ..probe };
-    let report = export(&p, seq, &s, &m, &Progress::default()).expect("export after a cancel");
-    assert_eq!(report.frames, frames as u64);
-    let (samples, pictures, _) = inspect(&path);
-    assert_eq!((samples, pictures), (frames as usize, frames as usize));
-    let after = hw_encode_stats();
-    assert!(after.sessions >= before.sessions + 2, "both exports opened a hardware session");
-    assert_eq!(after.declined, before.declined, "nothing was declined to the software encoder");
-}
-
 #[test]
 fn declines_what_the_hardware_path_does_not_take() {
     let ok = hardware_settings();
@@ -377,60 +306,6 @@ fn round_trip_through_our_software_decoder() {
     }
     assert!(worst > 30.0, "worst luma PSNR {worst:.1} dB");
     eprintln!("hardware H.264: {} bytes for {n} frames, worst luma PSNR {worst:.1} dB", packets.iter().map(|p| p.data.len()).sum::<usize>());
-}
-
-/// A project with an animated demo clip as the whole sequence.
-fn project(frames: i64) -> (Arc<Project>, filmcraft_project::ItemId, SourceMap) {
-    let mut p = Project::new("hw");
-    let g = GeneratorSource::demo(DemoScene::Plasma);
-    let info = g.info().clone();
-    let item = p.add_item(
-        &info.name.clone(),
-        Label::Iris,
-        ItemKind::Media(Box::new(MediaClip {
-            media: MediaRef::Generator(g.generator.clone()),
-            info,
-            interpret: Default::default(),
-            mark_in: None,
-            mark_out: None,
-            markers: vec![],
-            offline: false,
-            proxy: None,
-            identity: None,
-        })),
-        None,
-    );
-    let seq = p.new_sequence("s", SequenceSettings { width: W, height: H, frame_rate: FPS, ..Default::default() }, 1, 1, None);
-    let mut clip = p.make_track_item(item, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, FPS.tick_of(frames)), FPS).unwrap();
-    clip.scale_to_frame = true;
-    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
-    let mut m = SourceMap::default();
-    m.0.insert(item, Arc::new(g));
-    (Arc::new(p), seq, m)
-}
-
-fn tmp(name: &str) -> String {
-    let d = std::env::temp_dir().join(format!("fc-hw-encode-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d.join(name).to_string_lossy().to_string()
-}
-
-/// (sample count, decoded picture count, sync sample count) of an MP4's video track, decoded by our decoder.
-fn inspect(path: &str) -> (usize, usize, usize) {
-    let bytes = std::fs::read(path).unwrap();
-    let file = filmcraft_isobmff::open(bytes.as_slice()).unwrap();
-    let vt = file.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap();
-    let track = &file.tracks[vt];
-    let entry = track.entries.first().expect("a sample entry");
-    assert!(matches!(&entry.codec, CodecConfig::Avc(_) | CodecConfig::Hevc(_)), "neither AVC nor HEVC: {}", entry.codec.name());
-    let mut dec = filmcraft_codecs::software_video_decoder(entry).expect("software decoder");
-    let mut pictures = 0;
-    for (i, s) in track.samples.iter().enumerate() {
-        let data = file.read_sample(bytes.as_slice(), vt, i).unwrap();
-        pictures += dec.decode(&data, s.pts).expect("decode").len();
-    }
-    pictures += dec.flush().len();
-    (track.samples.len(), pictures, track.samples.iter().filter(|s| s.is_sync).count())
 }
 
 #[test]

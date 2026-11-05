@@ -181,18 +181,30 @@ fn unknown_key(known: &Value, patch: &Value, prefix: &str) -> Option<String> {
 
 /// A frame rate from a number of frames per second (29.97 → 30000/1001) or "num/den".
 pub fn parse_rate(v: &Value) -> Option<FrameRate> {
-    if let Some(s) = v.as_str() {
+    let rate = if let Some(s) = v.as_str() {
         if let Some((n, d)) = s.split_once('/') {
-            return Some(FrameRate::new(n.trim().parse().ok()?, d.trim().parse().ok()?));
+            let n = n.trim().parse::<i64>().ok()?;
+            let d = d.trim().parse::<i64>().ok()?;
+            if n <= 0 || d <= 0 || n > i64::from(u32::MAX) || d > i64::from(u32::MAX) {
+                return None;
+            }
+            FrameRate::new(n, d)
+        } else {
+            return parse_rate(&json!(s.trim().parse::<f64>().ok()?));
         }
-        return parse_rate(&json!(s.trim().parse::<f64>().ok()?));
-    }
-    let f = v.as_f64().filter(|f| *f > 0.0 && *f <= 1000.0)?;
-    let ntsc = [(23.976, FrameRate::FPS_23_976), (29.97, FrameRate::FPS_29_97), (59.94, FrameRate::FPS_59_94), (119.88, FrameRate::FPS_119_88)];
-    if let Some((_, r)) = ntsc.iter().find(|(x, _)| (f - x).abs() < 0.01) {
-        return Some(*r);
-    }
-    if (f - f.round()).abs() < 1e-6 { Some(FrameRate::new(f.round() as i64, 1)) } else { Some(FrameRate::new((f * 1000.0).round() as i64, 1000)) }
+    } else if v.is_object() {
+        let n = v.get("num")?.as_i64()?;
+        let d = v.get("den")?.as_i64()?;
+        if n <= 0 || d <= 0 || n > i64::from(u32::MAX) || d > i64::from(u32::MAX) {
+            return None;
+        }
+        FrameRate::new(n, d)
+    } else {
+        let f = v.as_f64().filter(|f| f.is_finite() && *f > 0.0)?;
+        FrameRate::from_f64(f)
+    };
+    filmcraft_project::SequenceSettings { frame_rate: rate, ..Default::default() }.validate().ok()?;
+    Some(rate)
 }
 
 /// The preset named in `p` (or None), and the settings: preset ⊕ `settings` ⊕ flat overrides.

@@ -12,6 +12,8 @@
 pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
     icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.filmcraft.png")),
     accent: Some([0x8b, 0x5c, 0xf6]),
+    repo: "arianizadi/filmcraft",
+    developer: "Arian’s fork",
     ..craft_update::suite::FILMCRAFT
 };
 
@@ -38,6 +40,7 @@ macro_rules! tlf {
     };
 }
 
+pub mod agent_review;
 pub mod automation;
 pub mod brand;
 pub mod calc;
@@ -196,6 +199,7 @@ pub enum ControlNotice {
 }
 
 pub struct FilmcraftApp {
+    pub agent_review: agent_review::AgentReview,
     pub session: Session,
     pub ui: UiState,
     pub tokens: Tokens,

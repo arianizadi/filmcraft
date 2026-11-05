@@ -39,7 +39,7 @@ const NOT_YET: &str = "Not supported in FilmCraft yet";
 const LINEAR: &str = "FilmCraft always composites in linear light";
 
 /// The Timebase list (frames per second as num/den), Premiere's common rates.
-const TIMEBASES: [(i64, i64); 15] = [
+const TIMEBASES: [(i64, i64); 21] = [
     (10, 1),
     (12, 1),
     (25, 2),
@@ -55,6 +55,12 @@ const TIMEBASES: [(i64, i64); 15] = [
     (60, 1),
     (120_000, 1001),
     (120, 1),
+    (240, 1),
+    (480, 1),
+    (960, 1),
+    (1000, 1),
+    (1200, 1),
+    (2000, 1),
 ];
 const SAMPLE_RATES: [u32; 5] = [32_000, 44_100, 48_000, 88_200, 96_000];
 const MIXES: [&str; 4] = ["Stereo", "Mono", "5.1", "Adaptive"];
@@ -133,7 +139,7 @@ fn new_sequence_params(d: &SequenceSettingsDraft) -> (Map<String, Value>, Map<St
     }
     p.insert("width".into(), json!(d.width));
     p.insert("height".into(), json!(d.height));
-    p.insert("fps".into(), json!(rate(d).as_f64()));
+    p.insert("frameRate".into(), json!({"num":rate(d).num,"den":rate(d).den}));
     p.insert("sampleRate".into(), json!(d.sample_rate));
     p.insert("mix".into(), json!(d.mix));
     p.insert("video".into(), json!(d.video_tracks.min(256)));
@@ -221,7 +227,7 @@ fn changes(d: &SequenceSettingsDraft, cur: &SequenceSettings, cur_name: &str) ->
     }
     let r = rate(d);
     if r != cur.frame_rate {
-        p.insert("fps".into(), json!(r.as_f64()));
+        p.insert("frameRate".into(), json!({"num":r.num,"den":r.den}));
     }
     if (d.width, d.height) != (cur.width, cur.height) {
         p.insert("width".into(), json!(d.width));
@@ -330,6 +336,15 @@ fn general(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, cur: &SequenceSetti
             }
         });
         elems.push(("sequenceSettings.timebase".into(), resp.response.rect, shown));
+        ui.label("Custom:");
+        let num = ui.add(crate::widgets::number_drag(&mut d.fps_num).range(1..=i64::from(u32::MAX)).speed(1.0));
+        elems.push(("sequenceSettings.timebase.num".into(), num.rect, d.fps_num.to_string()));
+        ui.label("/");
+        let den = ui.add(crate::widgets::number_drag(&mut d.fps_den).range(1..=i64::from(u32::MAX)).speed(1.0));
+        elems.push(("sequenceSettings.timebase.den".into(), den.rect, d.fps_den.to_string()));
+        if num.changed() || den.changed() {
+            d.drop_frame &= rate(d).supports_drop_frame();
+        }
     });
     section(ui, "Video", |ui| {
         row(ui, label_w, "Frame Size:", true, |ui| {
@@ -607,7 +622,7 @@ mod tests {
         let (p, rest) = new_sequence_params(&d);
         assert_eq!(
             Value::Object(p),
-            json!({"name":"Shorts","width":1080,"height":1920,"fps":24_000.0/1001.0,"sampleRate":48_000,"mix":"Stereo","video":2,"audio":4})
+            json!({"name":"Shorts","width":1080,"height":1920,"frameRate":{"num":24_000,"den":1001},"sampleRate":48_000,"mix":"Stereo","video":2,"audio":4})
         );
         assert!(rest.is_empty(), "everything else is the default: {rest:?}");
         // what file.newSequence has no parameter for follows on the new sequence; a blank name
@@ -640,7 +655,7 @@ mod tests {
         let mut d = SequenceSettingsDraft { drop_frame: true, ..Default::default() };
         assert!(changes(&d, &cur, "").is_empty());
         (d.fps_num, d.fps_den) = (30_000, 1001);
-        assert_eq!(Value::Object(changes(&d, &cur, "")), json!({"fps":30_000.0/1001.0,"dropFrame":true}));
+        assert_eq!(Value::Object(changes(&d, &cur, "")), json!({"frameRate":{"num":30_000,"den":1001},"dropFrame":true}));
         // the name travels when it changed; blank or unchanged it doesn't
         let d = SequenceSettingsDraft { name: "  Rough Cut  ".into(), ..Default::default() };
         assert_eq!(Value::Object(changes(&d, &cur, "Sequence 01")), json!({"name":"Rough Cut"}));

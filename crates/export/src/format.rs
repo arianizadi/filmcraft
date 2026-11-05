@@ -523,12 +523,14 @@ impl ExportSettings {
         if let Some(rate) = self.frame_rate
             && (rate.num <= 0
                 || rate.den <= 0
-                || rate.as_f64() > 1000.0
+                || i128::from(rate.num) > i128::from(filmcraft_time::TICKS_PER_SECOND) * i128::from(rate.den)
                 || rate.num > i64::from(u32::MAX)
                 || rate.den > i64::from(u32::MAX)
                 || (i128::from(filmcraft_time::TICKS_PER_SECOND) * i128::from(rate.den) / i128::from(rate.num.max(1))) > i128::from(Tick::MAX.0))
         {
-            return Err(ExportError::Unsupported("output frame rate must be positive and at most 1000 fps".into()));
+            return Err(ExportError::Unsupported(
+                "output frame rate must be positive, use unsigned 32-bit rational components, and have at least one tick per frame".into(),
+            ));
         }
         self.validate_audio_settings()?;
         if self.field_order != FieldOrder::Progressive && self.has_video() {

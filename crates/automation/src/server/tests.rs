@@ -1,11 +1,68 @@
 use super::*;
 
-#[test]
-fn render_scale_zero_means_no_limit() {
-    assert_eq!(render_scale(0, 1920, 1080), 1.0);
-    assert_eq!(render_scale(960, 1920, 1080), 0.5);
-    assert_eq!(render_scale(960, 640, 360), 1.0);
-    assert_eq!(render_scale(960, 0, 0), 1.0);
+fn result_json(result: &Value) -> Value {
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    let text = result["result"]["content"].as_array().unwrap().iter().find_map(|v| v["text"].as_str()).unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_workflow_renders_applies_once_and_rejects_stale_plans() {
+    let mut client = Client::start(demo());
+    client.init().await;
+    let session = result_json(&client.call(1, "agent_session", json!({})).await);
+    let initial = result_json(&client.call(2, "inspect", json!({})).await);
+    let history = result_json(&client.call(3, "command_run", json!({"id":"history.list"})).await);
+    let plan = result_json(
+        &client
+            .call(
+                4,
+                "plan_edit",
+                json!({"label":"Two reviewed cuts","base_revision":initial["revision"],
+        "steps":[{"id":"sequence.addEditAllTracks","params":{"seconds":2.0}},{"id":"sequence.addEditAllTracks","params":{"seconds":4.0}}]}),
+            )
+            .await,
+    );
+    assert_eq!(result_json(&client.call(5, "inspect", json!({})).await), initial, "proposal did not edit live state");
+    let preview = client.call(6, "render_frames", json!({"plan":plan["plan"],"frames":[48],"max_side":64,"comparison":true})).await;
+    assert_ne!(preview["result"]["isError"], true, "{preview}");
+    assert_eq!(preview["result"]["content"].as_array().unwrap().iter().filter(|c| c["type"] == "image").count(), 2);
+    let args = json!({"plan":plan["plan"],"session_id":session["sessionId"],"operation_id":"reviewed-edit-1","idempotency_key":"reviewed-edit-1"});
+    let receipt = result_json(&client.call(7, "apply_plan", args.clone()).await);
+    assert_eq!(receipt["status"], "committed");
+    let replay = result_json(&client.call(8, "apply_plan", args).await);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(receipt["afterRevision"], replay["afterRevision"]);
+    let after_history = result_json(&client.call(9, "command_run", json!({"id":"history.list"})).await);
+    assert_eq!(after_history["undo"].as_array().unwrap().len(), history["undo"].as_array().unwrap().len() + 1);
+    let lookup = result_json(&client.call(10, "get_operation", json!({"operation_id":"reviewed-edit-1","session_id":session["sessionId"]})).await);
+    assert_eq!(lookup["affected"], receipt["affected"]);
+    let stale = result_json(&client.call(11, "plan_edit", json!({"steps":[{"id":"markers.add","params":{"name":"Stale"}}]})).await);
+    client.call(12, "command_run", json!({"id":"markers.add","params":{"name":"Changed live"}})).await;
+    let rejected = client
+        .call(13, "apply_plan", json!({"plan":stale["plan"],"session_id":session["sessionId"],"operation_id":"stale-1","idempotency_key":"stale-1"}))
+        .await;
+    let rejected = result_json(&rejected);
+    assert_eq!(rejected["status"], "failed");
+    assert!(rejected["error"].as_str().unwrap().contains("stale_plan"));
+}
+
+#[tokio::test]
+async fn inspect_permission_cannot_propose_or_bypass_with_generic_tools() {
+    let mut s = demo();
+    s.operations.permission = filmcraft_engine::operations::Permission::Inspect;
+    let mut c = Client::start(s);
+    c.init().await;
+    assert_ne!(c.call(1, "inspect", json!({"fields":["settings"]})).await["result"]["isError"], true);
+    for (id, arguments) in [
+        ("agent.plan", json!({"steps":[{"id":"markers.add"}]})),
+        ("lut.export", json!({"path":"/tmp/unauthorized.cube"})),
+        ("sequence.addEditAllTracks", json!({"seconds":2.0})),
+    ] {
+        let r = c.call(2, "command_run", json!({"id":id,"params":arguments})).await;
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("permission_denied"), "{r}");
+    }
 }
 
 #[tokio::test]
@@ -402,60 +459,38 @@ async fn doc_inspect_handles_an_active_sequence_id_above_i64_max() {
     assert_eq!(v["sequence"]["id"].as_u64(), Some(HUGE), "an id above i64::MAX must still be inspected, not dropped to a null sequence: {v}");
 }
 
-/// Bridge `render_frame` with `seconds` moves the app's single playhead, screenshots the single
-/// Program monitor and moves the playhead back. Parallel calls (the tool is annotated read-only and
-/// idempotent, so clients send them that way) interleaved those steps and got each other's frames
-/// (#3837). Each call has to return the frame at its own time.
+/// Parallel bridge renders carry their requested time and never send seeks or screenshots.
 #[tokio::test]
 async fn parallel_bridge_render_frames_each_return_their_own_frame() {
-    use base64::Engine as _;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let playhead = Arc::new(std::sync::atomic::AtomicI64::new(200));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let app_playhead = playhead.clone();
     tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
-            let playhead = app_playhead.clone();
             tokio::spawn(async move {
                 let (r, mut w) = s.into_split();
                 let mut lines = tokio::io::BufReader::new(r).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let req: Value = serde_json::from_str(&line).unwrap();
-                    let params = &req["params"]["params"];
-                    let result = match (req["method"].as_str().unwrap_or_default(), req["params"]["command"].as_str().unwrap_or_default()) {
-                        (_, "sequence.inspect") => json!({"playhead": playhead.load(std::sync::atomic::Ordering::SeqCst)}),
-                        (_, "playhead.set") => {
-                            let t = params["seconds"].as_f64().map(|x| x as i64).or_else(|| params["time"].as_i64()).unwrap_or(0);
-                            playhead.store(t, std::sync::atomic::Ordering::SeqCst);
-                            Value::Null
-                        }
-                        ("ui.screenshot", _) => {
-                            // the monitor shows whatever the playhead is at when the screenshot is taken
-                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                            let shade = playhead.load(std::sync::atomic::Ordering::SeqCst) as u8;
-                            let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([shade, 0, 0, 255]));
-                            img.save(req["params"]["path"].as_str().unwrap()).unwrap();
-                            Value::Null
-                        }
-                        _ => Value::Null,
-                    };
-                    let line = format!("{}\n", json!({"id": req["id"], "ok": true, "result": result}));
-                    w.write_all(line.as_bytes()).await.unwrap();
+                    assert_eq!(req["method"], "engine.execute");
+                    assert_eq!(req["params"]["command"], "render.frames");
+                    let tick = req["params"]["params"]["times"][0].as_i64().unwrap();
+                    let shade = filmcraft_time::Tick(tick).seconds() as u8;
+                    let png = png_rgba(1, 1, vec![shade, 0, 0, 255], 0).unwrap();
+                    let result = json!({"frames":[{"time":tick,"image":{"base64":base64::engine::general_purpose::STANDARD.encode(png)}}]});
+                    w.write_all(format!("{}\n", json!({"id":req["id"],"ok":true,"result":result})).as_bytes()).await.unwrap();
                 }
             });
         }
     });
     let m = FilmcraftMcp::bridge(&addr).unwrap();
-    let call = |seconds: f64| m.render_frame(Parameters(RenderParams { seconds: Some(seconds), max_side: Some(640) }));
+    let call = |seconds| m.render_frame(Parameters(RenderParams { seconds: Some(seconds), max_side: Some(64) }));
     let results = tokio::join!(call(5.0), call(20.0), call(35.0), call(50.0));
     for (res, want) in [(results.0, 5u8), (results.1, 20), (results.2, 35), (results.3, 50)] {
         let v = serde_json::to_value(res.unwrap()).unwrap();
         let png = base64::engine::general_purpose::STANDARD.decode(v["content"][0]["data"].as_str().unwrap()).unwrap();
-        let px = image::load_from_memory(&png).unwrap().to_rgba8().get_pixel(0, 0).0;
-        assert_eq!(px[0], want, "frame at {want} s came from another call's playhead");
+        assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8().get_pixel(0, 0).0[0], want);
     }
-    assert_eq!(playhead.load(std::sync::atomic::Ordering::SeqCst), 200, "the playhead must end where it started");
 }
 
 /// A client that floods malformed lines and never reads its output stalls its own input: parse

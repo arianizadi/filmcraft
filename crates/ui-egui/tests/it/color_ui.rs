@@ -377,6 +377,22 @@ fn hdr_lumetri_controls_hsl_refine_and_comparison_view() {
     d.app().ui.program.compare_ref = Some(rate.tick_of(frame).0);
     d.frames(3);
     d.snapshot("color-comparison-view", None);
+    let before_match = d.app().session.project.to_json();
+    let revision_before_match = d.app().session.revision;
+    let history_before_match = d.exec("history.list", json!({}));
+    // Matching uses SDR grading math. In an HDR working sequence the UI must surface the
+    // unsupported error and preserve the project, revision and undo/redo history.
+    d.click("lumetri.match.apply");
+    let ui = d.ok("ui.inspect", json!({}));
+    assert!(ui.to_string().contains("HDR and wide-gamut working-space matching is unsupported"), "{ui}");
+    assert_eq!(d.app().session.project.to_json(), before_match);
+    assert_eq!(d.app().session.revision, revision_before_match);
+    assert_eq!(d.exec("history.list", json!({})), history_before_match);
+    // The same comparison reference still drives matching after switching to a supported
+    // Rec.709 working sequence; comparison UI state is retained across the color change.
+    d.exec("sequence.colorSettings", json!({"workingSpace":"rec709","wideGamut":false}));
+    d.frames(3);
+    assert_eq!(d.app().ui.program.display_mode(), Some(filmcraft_ui_egui::state::DisplayMode::Comparison));
     d.click("lumetri.match.apply");
     let e = lumetri(&mut d, clip);
     assert!(e["params"]["wheel_highlights"]["value"].as_str().unwrap() != "Vec2(Vec2 { x: 0.0, y: 0.0 })", "matched to the comparison reference: {e}");

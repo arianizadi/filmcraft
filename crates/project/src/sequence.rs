@@ -115,12 +115,12 @@ impl SequenceSettings {
         validate_frame_size(self.width, self.height)?;
         if self.frame_rate.num <= 0
             || self.frame_rate.den <= 0
-            || self.frame_rate.as_f64() > 1000.0
+            || i128::from(self.frame_rate.num) > i128::from(TICKS_PER_SECOND) * i128::from(self.frame_rate.den)
             || self.frame_rate.num > i64::from(u32::MAX)
             || self.frame_rate.den > i64::from(u32::MAX)
             || (i128::from(TICKS_PER_SECOND) * i128::from(self.frame_rate.den) / i128::from(self.frame_rate.num.max(1))) > i128::from(Tick::MAX.0)
         {
-            return Err("frame rate must be positive, at most 1000 fps, with unsigned 32-bit rational components".into());
+            return Err("frame rate must be positive, have at least one tick per frame, and use unsigned 32-bit rational components".into());
         }
         if self.sample_rate == 0 || self.sample_rate > 384_000 {
             return Err("sample rate must be between 1 and 384000 Hz".into());

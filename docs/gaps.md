@@ -1,6 +1,6 @@
 # Where FilmCraft falls short of Premiere Pro
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-30 · **Change:** minor (G14 catalog counts refreshed; G13 GIF binary transparency retained) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-11-04 · **Change:** minor (personal fork workflow documented; baseline estimates unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Every known shortfall, one entry each, ranked by what most stops an editor using FilmCraft for real
 work. This is the work list: agents should prefer it over adding checklist items. Numbers are in
@@ -34,6 +34,16 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 | G18 | Effects depth: approximations and missing behaviour | feature | no | 60–110 h |
 | G19 | Speech to text off in release builds | feature, AI | no | 5–10 h |
 | G20 | The web app shell | platforms | no | 40–80 h |
+
+## Personal fork update — 2026-11-04
+
+The [agent review workflow](agent-workflow.md) adds staged edits, exact previews, typed grading,
+retry receipts and local regression/footage tests. The [format audit](format-compatibility.md)
+verifies generated stream profiles; it does not close the shared real-world-corpus gap.
+The macOS packaging script now enables Whisper with explicit model downloads; other distribution
+builds still need feature verification. Persistent review, semantic indexing, segmentation and
+validated HDR matching/delivery remain open. Baseline readiness estimates are unchanged.
+
 
 ## G1. Nothing compares our output with Premiere's
 
@@ -330,6 +340,10 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 - **Estimate:** 60–110 h.
 
 ## G19. Speech to text off in release builds
+
+Personal fork macOS packages now enable Whisper and its explicit model downloader; the installed
+Mac build reports `transcript.models.available=true`. Models are not downloaded automatically.
+Other platforms/default feature builds still need verification.
 
 - **Missing:** the `whisper` feature is off by default and in releases, so Transcribe Sequence,
   text-based editing and auto captions need a source build.

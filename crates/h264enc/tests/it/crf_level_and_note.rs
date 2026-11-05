@@ -1,5 +1,5 @@
 //! Constant quality has no bitrate cap, so the level must allow what low factors spend; and every
-//! stream says which settings made it.
+//! default stream says which settings made it.
 
 use crate::common;
 
@@ -42,4 +42,29 @@ fn first_access_unit_carries_the_settings() {
     }
     // once per stream
     assert!(packets.iter().skip(1).all(|p| !text(p).contains("filmcraft-h264enc")));
+}
+
+#[test]
+fn optional_diagnostic_note_does_not_disable_hdr_metadata() {
+    for (diagnostic, hdr, want_sei) in [(true, false, 1), (false, false, 0), (false, true, 1)] {
+        let mut cfg = EncoderConfig::new(64, 48, 30, 1);
+        cfg.encoder_note = diagnostic;
+        cfg.bframes = 0;
+        cfg.threads = 1;
+        if hdr {
+            cfg.mastering_display = Some([0u8; 24]);
+            cfg.content_light = Some((1000, 400));
+        }
+        let mut encoder = Encoder::new(cfg).unwrap();
+        let frame = synth(64, 48, 0);
+        let mut packets = encoder.encode(&frame.frame(), 0).unwrap();
+        packets.extend(encoder.flush());
+        let data = &packets[0].data;
+        assert_eq!(String::from_utf8_lossy(data).contains("filmcraft-h264enc"), diagnostic);
+        let sei: Vec<_> = common::annexb_nals(data).into_iter().filter(|r| data.get(r.start + 3).is_some_and(|v| v & 31 == 6)).collect();
+        assert_eq!(sei.len(), want_sei);
+        if hdr {
+            assert!(sei.iter().any(|r| data.get(r.start + 4) == Some(&137)), "SMPTE ST2086 metadata remains present without diagnostic text");
+        }
+    }
 }

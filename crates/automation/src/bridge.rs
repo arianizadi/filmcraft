@@ -27,6 +27,7 @@ pub struct BridgeClient {
     /// never holds up the others or leaves its late reply for the next one to read (#1538).
     idle: Mutex<Vec<Conn>>,
     next_id: AtomicU64,
+    client_id: String,
 }
 
 impl BridgeClient {
@@ -38,7 +39,13 @@ impl BridgeClient {
         if !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
             return Err(AutomationError::BadRequest(format!("bridge address must be loopback, got `{addr}`")));
         }
-        Ok(Self { addr, token: std::env::var("FILMCRAFT_CONTROL_TOKEN").ok(), idle: Mutex::new(Vec::new()), next_id: AtomicU64::new(1) })
+        Ok(Self {
+            addr,
+            token: std::env::var("FILMCRAFT_CONTROL_TOKEN").ok(),
+            idle: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(1),
+            client_id: format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+        })
     }
 
     /// Run engine command `id` in the app. A blocking export (`file.exportMedia` with
@@ -78,17 +85,76 @@ impl BridgeClient {
         Ok(start)
     }
 
-    /// Call a control method; returns `result` or the app's error.
+    /// Execute a write with a caller-owned operation identity and retain its complete receipt.
+    pub async fn execute_operation(
+        &self,
+        command: &str,
+        params: Value,
+        operation: &str,
+        key: &str,
+        base: Option<u64>,
+        session_id: Option<&str>,
+    ) -> Result<Value, AutomationError> {
+        let session = if let Some(id) = session_id {
+            json!({"sessionId":id})
+        } else {
+            self.call_raw("engine.execute", json!({"command":"agent.session", "params":{}}), true).await?
+        };
+        let session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AutomationError::Bridge("app does not support operation receipts; update FilmCraft before sending writes".into()))?;
+        self.call_raw(
+            "engine.execute",
+            json!({"command":"agent.execute", "params":{
+                "operationId":operation, "idempotencyKey":key, "sessionId":session_id,
+                "baseRevision":base, "command":command, "params":params
+            }}),
+            true,
+        )
+        .await
+        .map_err(|error| {
+            AutomationError::Bridge(format!("{error}; operationId={operation}, sessionId={session_id}; query get_operation before submitting another write"))
+        })
+    }
+
+    /// Call a control method. Engine writes use operation receipts; UI gestures are never retried.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, AutomationError> {
-        for attempt in 0..2 {
-            // A retry gets a fresh connection: the failed one may have been closed by an app restart.
+        if method == "engine.execute"
+            && let Some(command) = params.get("command").and_then(Value::as_str)
+            && command != "agent.execute"
+            && filmcraft_engine::find_command(command).is_some()
+            && filmcraft_engine::operations::is_write(command, params.get("params").unwrap_or(&Value::Null))
+        {
+            let operation = format!("bridge-{}-{}", self.client_id, self.next_id.fetch_add(1, Ordering::Relaxed));
+            let receipt =
+                self.execute_operation(command, params.get("params").cloned().unwrap_or_else(|| json!({})), &operation, &operation, None, None).await?;
+            return operation_result(receipt);
+        }
+        let retry = matches!(
+            method,
+            "engine.commands" | "ui.inspect" | "ui.elements" | "ui.menu.list" | "ui.docking" | "ui.timeline.hit" | "ui.timeline.locate" | "perf.stats"
+        ) || (method == "engine.execute"
+            && params
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == "agent.execute" || !filmcraft_engine::operations::is_write(id, params.get("params").unwrap_or(&Value::Null))));
+        self.call_raw(method, params, retry).await
+    }
+
+    async fn call_raw(&self, method: &str, params: Value, retry: bool) -> Result<Value, AutomationError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let line = format!("{}\n", json!({"id": id, "token": self.token, "method": method, "params": params}));
+        for attempt in 0..if retry { 2 } else { 1 } {
             let idle = if attempt == 0 { self.idle.lock().await.pop() } else { None };
             let mut conn = match idle {
                 Some(c) => c,
-                None => self.connect().await?,
+                None => match self.connect().await {
+                    Ok(c) => c,
+                    Err(e) if attempt > 0 => return Err(unknown_commit(method, &params, e)),
+                    Err(e) => return Err(e),
+                },
             };
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let line = format!("{}\n", json!({"id": id, "token": self.token, "method": method, "params": params}));
             let res: Result<Value, AutomationError> = async {
                 conn.1.write_all(line.as_bytes()).await.map_err(|e| AutomationError::Bridge(e.to_string()))?;
                 let mut buf = String::new();
@@ -96,7 +162,11 @@ impl BridgeClient {
                     .await
                     .map_err(|_| AutomationError::Bridge("timeout".into()))?
                     .map_err(|e| AutomationError::Bridge(e.to_string()))?;
-                serde_json::from_str(&buf).map_err(|e| AutomationError::Bridge(format!("bad reply: {e}")))
+                let reply: Value = serde_json::from_str(&buf).map_err(|e| AutomationError::Bridge(format!("bad reply: {e}")))?;
+                if reply.get("id").and_then(Value::as_u64) != Some(id) {
+                    return Err(AutomationError::Bridge("reply request ID mismatch".into()));
+                }
+                Ok(reply)
             }
             .await;
             match res {
@@ -112,11 +182,11 @@ impl BridgeClient {
                         Err(AutomationError::App(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string()))
                     };
                 }
-                Err(_) if attempt == 0 => {}
-                Err(e) => return Err(e),
+                Err(_) if attempt == 0 && retry => {}
+                Err(e) => return Err(unknown_commit(method, &params, e)),
             }
         }
-        Err(AutomationError::Bridge("unreachable".into()))
+        Err(AutomationError::Bridge("request did not complete".into()))
     }
 
     async fn connect(&self) -> Result<Conn, AutomationError> {
@@ -130,6 +200,31 @@ impl BridgeClient {
         let (r, w) = s.into_split();
         Ok((BufReader::new(r), w))
     }
+}
+
+/// Keep legacy command result shapes while the explicit operation tool returns the full receipt.
+pub fn operation_result(receipt: Value) -> Result<Value, AutomationError> {
+    if receipt.get("status").and_then(Value::as_str) == Some("committed") {
+        Ok(receipt.get("result").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(AutomationError::App(format!(
+            "{}: {} (operation {})",
+            receipt["status"],
+            receipt.get("error").and_then(Value::as_str).unwrap_or("inspect get_operation before retrying"),
+            receipt["operationId"]
+        )))
+    }
+}
+
+fn unknown_commit(method: &str, params: &Value, error: AutomationError) -> AutomationError {
+    let command = params.get("command").and_then(Value::as_str);
+    if method == "engine.execute" && command.is_some_and(|id| !filmcraft_engine::operations::is_write(id, params.get("params").unwrap_or(&Value::Null))) {
+        return error;
+    }
+    AutomationError::Bridge(format!(
+        "unknown_commit: {error}; operationId={}; check get_operation and inspect before submitting another write",
+        params.pointer("/params/operationId").and_then(Value::as_str).unwrap_or("untracked UI gesture")
+    ))
 }
 
 #[cfg(test)]
@@ -156,7 +251,16 @@ mod tests {
             let mut lines = BufReader::new(r).lines();
             let mut polls = 0;
             while let Ok(Some(line)) = lines.next_line().await {
-                let req: Value = serde_json::from_str(&line).unwrap();
+                let mut req: Value = serde_json::from_str(&line).unwrap();
+                if req["params"]["command"] == "agent.session" {
+                    let line = format!("{}\n", json!({"id":req["id"],"ok":true,"result":{"sessionId":"test-app"}}));
+                    w.write_all(line.as_bytes()).await.unwrap();
+                    continue;
+                }
+                let envelope = req["params"]["command"] == "agent.execute";
+                if envelope {
+                    req["params"] = req["params"]["params"].clone();
+                }
                 log.lock().await.push(req.clone());
                 let reply = match req["params"]["command"].as_str() {
                     Some("file.exportMedia") => json!({"job": 7, "path": "/tmp/out.mov"}),
@@ -171,11 +275,64 @@ mod tests {
                     }
                     _ => json!(null),
                 };
+                let reply = if envelope { json!({"status":"committed","result":reply}) } else { reply };
                 let line = format!("{}\n", json!({"id": req["id"], "ok": true, "result": reply}));
                 w.write_all(line.as_bytes()).await.unwrap();
             }
         });
         (addr, seen)
+    }
+
+    async fn lossy_app(restart: bool) -> (String, Arc<Mutex<filmcraft_engine::Session>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let session = Arc::new(Mutex::new(filmcraft_engine::Session::default()));
+        let app = session.clone();
+        tokio::spawn(async move {
+            let mut lost = false;
+            while let Ok((socket, _)) = listener.accept().await {
+                let (r, mut w) = socket.into_split();
+                let mut lines = BufReader::new(r).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let command = req["params"]["command"].as_str().unwrap();
+                    let result = app.lock().await.execute(command, req["params"]["params"].clone());
+                    if command == "agent.execute" && !lost {
+                        lost = true;
+                        if restart {
+                            *app.lock().await = filmcraft_engine::Session::default();
+                        }
+                        break; // The write landed; the reply and connection are lost.
+                    }
+                    let reply = match result {
+                        Ok(v) => json!({"id":req["id"],"ok":true,"result":v}),
+                        Err(e) => json!({"id":req["id"],"ok":false,"error":e.to_string()}),
+                    };
+                    w.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                }
+            }
+        });
+        (addr, session)
+    }
+
+    #[tokio::test]
+    async fn lost_write_reply_replays_receipt_instead_of_the_edit() {
+        let (addr, session) = lossy_app(false).await;
+        let b = BridgeClient::new(addr).unwrap();
+        let result = b.execute("file.newSequence", json!({"name":"Once"})).await.unwrap();
+        assert!(result.get("item").is_some() || result.get("sequence").is_some(), "{result}");
+        let s = session.lock().await;
+        assert_eq!(s.project.sequences().count(), 1);
+        assert_eq!(s.history.undo.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restarting_app_after_lost_reply_refuses_to_reexecute() {
+        let (addr, session) = lossy_app(true).await;
+        let b = BridgeClient::new(addr).unwrap();
+        let error = b.execute("file.newSequence", json!({"name":"Once"})).await.unwrap_err();
+        assert!(error.to_string().contains("unknown_commit"), "{error}");
+        assert_eq!(session.lock().await.project.sequences().count(), 0);
     }
 
     /// A refused connection names the launch command and the token requirement (#3436): the

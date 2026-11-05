@@ -14,6 +14,12 @@ use serde_json::{Value, json};
 
 use crate::{AutomationError, BridgeClient, png_rgba};
 
+mod workflow;
+use workflow::{
+    ApplyParams, DescribeParams, Effects, FramesParams, GetOperationParams, GradeAddress, GradeCopyParams, GradeGetParams, GradePatchParams, GradeResetParams,
+    InspectParams, MatchMode, MatchParams, OperationParams, PlanIdParams, PlanParams, RenderTarget, ScopesParams,
+};
+
 pub enum Backend {
     Headless(Arc<Mutex<Session>>),
     Bridge(Arc<BridgeClient>),
@@ -35,9 +41,6 @@ fn join_error(e: tokio::task::JoinError) -> AutomationError {
 #[derive(Clone)]
 pub struct FilmcraftMcp {
     backend: Arc<Backend>,
-    /// Bridge `render_frame` moves the app's one playhead and screenshots the one Program monitor, so
-    /// calls (which MCP clients may send in parallel) take turns instead of seeing each other's frame.
-    render_lock: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -49,6 +52,8 @@ pub struct ListParams {
     /// Only commands that can run right now.
     #[serde(default)]
     pub enabled_only: Option<bool>,
+    /// Command category (the prefix before the first dot).
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -182,6 +187,37 @@ pub struct ControlParams {
     pub params: Option<Value>,
 }
 
+fn frame_contents(mut v: Value) -> CallToolResult {
+    fn extract(v: &mut Value, out: &mut Vec<Content>) {
+        match v {
+            Value::Object(map) => {
+                for key in ["png", "pngBase64", "imageBase64", "base64"] {
+                    if let Some(Value::String(encoded)) = map.remove(key) {
+                        out.push(Content::image(encoded, "image/png"));
+                        map.insert("imageContent".into(), json!(out.len()));
+                    }
+                }
+                for value in map.values_mut() {
+                    extract(value, out);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    extract(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    extract(&mut v, &mut out);
+    match serde_json::to_string_pretty(&v) {
+        Ok(note) => out.push(Content::text(note)),
+        Err(e) => return fail(e),
+    }
+    CallToolResult::success(out)
+}
+
 fn ok_json(v: &Value) -> CallToolResult {
     CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(v).unwrap_or_default())])
 }
@@ -203,10 +239,10 @@ const MAX_QUEUED_PARSE_ERRORS: usize = 64;
 
 impl FilmcraftMcp {
     pub fn headless(session: Session) -> Self {
-        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), render_lock: Arc::default(), tool_router: Self::tool_router() }
+        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), render_lock: Arc::default(), tool_router: Self::tool_router() })
+        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() })
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
@@ -277,7 +313,14 @@ impl FilmcraftMcp {
     }
 
     /// Run an engine command on whichever backend.
-    pub async fn run(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+    pub async fn run(&self, id: &str, mut params: Value) -> Result<Value, AutomationError> {
+        if matches!(
+            id,
+            "agent.plan" | "render.frames" | "grade.get" | "grade.patch" | "grade.copy" | "grade.reset" | "grade.matchBatch" | "scopes.read" | "agent.inspect"
+        ) && let Some(map) = params.as_object_mut()
+        {
+            map.retain(|_, v| !v.is_null());
+        }
         match &*self.backend {
             Backend::Headless(s) => {
                 let s = s.clone();
@@ -285,12 +328,28 @@ impl FilmcraftMcp {
                 tokio::task::spawn_blocking(move || {
                     // A command that panicked earlier poisoned the lock; the session is still usable.
                     let mut g = s.lock().unwrap_or_else(PoisonError::into_inner);
+                    filmcraft_engine::operations::authorize(&g, &id, &params)?;
                     g.execute(&id, params).map_err(AutomationError::from)
                 })
                 .await
                 .map_err(join_error)?
             }
             Backend::Bridge(b) => b.execute(id, params).await,
+        }
+    }
+
+    async fn operation(&self, p: OperationParams) -> Result<Value, AutomationError> {
+        let params = p.params.unwrap_or_else(|| json!({}));
+        match &*self.backend {
+            Backend::Headless(_) => {
+                self.run(
+                    "agent.execute",
+                    json!({"sessionId":p.session_id,"operationId":p.operation_id,
+                "idempotencyKey":p.idempotency_key,"command":p.id,"params":params,"baseRevision":p.base_revision}),
+                )
+                .await
+            }
+            Backend::Bridge(b) => b.execute_operation(&p.id, params, &p.operation_id, &p.idempotency_key, p.base_revision, Some(&p.session_id)).await,
         }
     }
 
@@ -342,6 +401,7 @@ impl FilmcraftMcp {
         let r = self.run("command.list", json!({})).await.map(|v| {
             let f = p.filter.unwrap_or_default().to_ascii_lowercase();
             let only = p.enabled_only.unwrap_or(false);
+            let category = p.category.unwrap_or_default();
             Value::Array(
                 v.as_array()
                     .cloned()
@@ -350,12 +410,281 @@ impl FilmcraftMcp {
                     .filter(|c| {
                         let id = c["id"].as_str().unwrap_or("").to_ascii_lowercase();
                         let label = c["label"].as_str().unwrap_or("").to_ascii_lowercase();
-                        (f.is_empty() || id.contains(&f) || label.contains(&f)) && (!only || c["enabled"].as_bool() == Some(true))
+                        (f.is_empty() || id.contains(&f) || label.contains(&f))
+                            && (!only || c["enabled"].as_bool() == Some(true))
+                            && (category.is_empty() || id.split('.').next() == Some(category.as_str()))
                     })
                     .collect(),
             )
         });
         wrap(r)
+    }
+
+    #[tool(
+        title = "Inspect agent session",
+        description = "Get session_id, revision and Inspect/Propose/Edit permissions before submitting operations. Retain session_id across retries.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn agent_session(&self) -> Result<CallToolResult, McpError> {
+        wrap(self.run("agent.session", json!({})).await)
+    }
+
+    #[tool(
+        title = "Run retry-safe operation",
+        description = "Execute a command exactly once in this app session. Reuse operation_id, idempotency_key, session_id and identical arguments on retry. Returns a receipt with status, affected IDs and before/after revisions. A changed session refuses execution with unknown_commit. Start exports with wait:false and poll jobs.list using the receipt job ID.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn operation_run(&self, Parameters(p): Parameters<OperationParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.operation(p).await)
+    }
+
+    #[tool(
+        title = "Get operation receipt",
+        description = "Resolve a lost write reply. unknown_commit means inspect the project before creating another operation; it never proves the write did not land.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn get_operation(&self, Parameters(p): Parameters<GetOperationParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("agent.operation", json!({"operationId":p.operation_id,"sessionId":p.session_id})).await)
+    }
+
+    #[tool(
+        title = "Stage an edit proposal",
+        description = "Simulate eligible in-memory commands against one immutable revision. Returns a plan, typed before/after changes, stable created IDs, warnings and step results. Project, undo history and live selection remain unchanged. Params can reference a previous result with {\"$step\":0,\"path\":\"/clip\"}.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn plan_edit(&self, Parameters(p): Parameters<PlanParams>) -> Result<CallToolResult, McpError> {
+        let steps: Vec<Value> = p.steps.into_iter().map(|s| json!({"id":s.id,"params":s.params.unwrap_or_else(||json!({}))})).collect();
+        wrap(self.run("agent.plan", json!({"label":p.label,"baseRevision":p.base_revision,"steps":steps})).await)
+    }
+
+    #[tool(
+        title = "Inspect staged proposal",
+        description = "Inspect a plan's affected clips, tracks, grades and captions, warnings, results and stale state.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn preview_plan(&self, Parameters(p): Parameters<PlanIdParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("agent.preview", json!({"plan":p.plan})).await)
+    }
+
+    #[tool(
+        title = "Apply approved proposal",
+        description = "Apply an approved plan against its exact original project/revision as one undo step. Supply identities from agent_session and reuse them unchanged on retry. Stale plans refuse to apply.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn apply_plan(&self, Parameters(p): Parameters<ApplyParams>) -> Result<CallToolResult, McpError> {
+        wrap(
+            self.operation(OperationParams {
+                session_id: p.session_id,
+                operation_id: p.operation_id,
+                idempotency_key: p.idempotency_key,
+                id: "agent.apply".into(),
+                params: Some(json!({"plan":p.plan})),
+                base_revision: None,
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Discard staged proposal",
+        description = "Release an unapplied plan without editing the timeline.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn discard_plan(&self, Parameters(p): Parameters<PlanIdParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("agent.discard", json!({"plan":p.plan})).await)
+    }
+
+    #[tool(
+        title = "Inspect timeline range",
+        description = "Inspect one sequence, clip, half-open time range and/or selected fields. Returns revision and typed effect data. Positions are exact ticks.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn inspect(&self, Parameters(p): Parameters<InspectParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("agent.inspect", json!({"sequence":p.sequence,"clip":p.clip,"start":p.start,"end":p.end,"fields":p.fields})).await)
+    }
+
+    #[tool(
+        title = "Render exact snapshot frames",
+        description = "Render source media, an isolated clip, a sequence or a staged plan without seeking the UI. Returns PNGs with actual target, frame, timecode, revision and color transform; optionally before/after pairs or a contact sheet.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn render_frames(&self, Parameters(p): Parameters<FramesParams>) -> Result<CallToolResult, McpError> {
+        let target = p.target.map(|v| match v {
+            RenderTarget::Sequence => "sequence",
+            RenderTarget::Clip => "clip",
+            RenderTarget::Source => "source",
+        });
+        let effects = p.effects.map(|v| match v {
+            Effects::Pre => "pre",
+            Effects::Post => "post",
+        });
+        let r = self.run("render.frames", json!({"target":target,"sequence":p.sequence,"clip":p.clip,"item":p.item,"frames":p.frames,
+            "times":p.times,"maxSide":p.max_side,"effects":effects,"captions":p.captions,"plan":p.plan,"comparison":p.comparison,"layout":if p.contact_sheet==Some(true){"contactSheet"}else{"stills"}})).await;
+        Ok(match r {
+            Ok(v) => frame_contents(v),
+            Err(e) => fail(e),
+        })
+    }
+
+    #[tool(
+        title = "Read typed grades",
+        description = "Read all Lumetri instances on an explicit clip, including values, wheel vectors, curve/LUT references, masks and full keyframes. Retain the revision and effectInstance for patches.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn grade_get(&self, Parameters(p): Parameters<GradeGetParams>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("grade.get", json!({"clip":p.clip,"sequence":p.sequence})).await)
+    }
+
+    #[tool(
+        title = "Patch a grade",
+        description = "Change only supplied controls on an explicitly addressed Lumetri instance. Other controls, masks and animation are preserved. expected_revision guards ordinal addresses; replacing animation requires replace_keyframes:true. Prefer this as a plan step.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn grade_patch(&self, Parameters(p): Parameters<GradePatchParams>) -> Result<CallToolResult, McpError> {
+        wrap(
+            self.run(
+                "grade.patch",
+                json!({"clip":p.clip,"sequence":p.sequence,"effectInstance":p.effect_instance,
+            "expectedRevision":p.expected_revision,"params":p.params,"masks":p.masks,"enabled":p.enabled,"replaceKeyframes":p.replace_keyframes}),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Copy a grade",
+        description = "Copy a typed Lumetri grade to explicit target instances atomically with revision and animation guards.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn grade_copy(&self, Parameters(p): Parameters<GradeCopyParams>) -> Result<CallToolResult, McpError> {
+        let address = |a: GradeAddress| {
+            let mut v = json!({"clip":a.clip,"effectInstance":a.effect_instance});
+            if let Some(seq) = a.sequence {
+                v["sequence"] = json!(seq);
+            }
+            v
+        };
+        let targets: Vec<Value> = p.targets.into_iter().map(address).collect();
+        wrap(
+            self.run(
+                "grade.copy",
+                json!({"source":address(p.source),"targets":targets,"expectedRevision":p.expected_revision,"replaceKeyframes":p.replace_keyframes}),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Reset grade controls",
+        description = "Reset named controls or the complete addressed grade. Animation replacement requires explicit consent and expected_revision.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn grade_reset(&self, Parameters(p): Parameters<GradeResetParams>) -> Result<CallToolResult, McpError> {
+        wrap(
+            self.run(
+                "grade.reset",
+                json!({"clip":p.clip,"sequence":p.sequence,"effectInstance":p.effect_instance,
+            "expectedRevision":p.expected_revision,"params":p.params,"replaceKeyframes":p.replace_keyframes}),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Describe one command",
+        description = "Get one command's category, enablement/disabled reason, units, staging eligibility and its typed MCP parameter schema when available. Legacy commands retain their parameter documentation.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn command_describe(&self, Parameters(p): Parameters<DescribeParams>) -> Result<CallToolResult, McpError> {
+        let catalog = match self.run("command.list", json!({})).await {
+            Ok(v) => v,
+            Err(e) => return Ok(fail(e)),
+        };
+        let Some(mut command) = catalog.as_array().and_then(|a| a.iter().find(|v| v["id"] == p.id)).cloned() else { return Ok(fail("unknown command")) };
+        command["eligibleForPlan"] = json!(filmcraft_engine::agent_plans::eligible_command(&p.id));
+        let tool = match p.id.as_str() {
+            "agent.plan" => Some("plan_edit"),
+            "agent.apply" => Some("apply_plan"),
+            "agent.preview" => Some("preview_plan"),
+            "agent.inspect" => Some("inspect"),
+            "render.frames" => Some("render_frames"),
+            "grade.get" => Some("grade_get"),
+            "grade.patch" => Some("grade_patch"),
+            "grade.copy" => Some("grade_copy"),
+            "grade.reset" => Some("grade_reset"),
+            "grade.matchBatch" => Some("grade_match_batch"),
+            "scopes.read" => Some("scopes_read"),
+            _ => None,
+        };
+        if let Some(tool) = tool
+            && let Some(def) = self.tool_router.get(tool)
+        {
+            command["schemaTool"] = json!(tool);
+            command["inputSchema"] = Value::Object((*def.input_schema).clone());
+            command["schemaStatus"] = json!("typed_mcp_tool");
+        } else {
+            command["schemaStatus"] = json!("legacy_parameter_documentation");
+        }
+        Ok(ok_json(&command))
+    }
+
+    #[tool(
+        title = "Match shots to hero",
+        description = "Match explicit clips to a hero clip or imported reference item with multiple frame samples. Supports full, exposure and white_balance passes, confidence skipping, animation protection and per-clip verified deltas. Use this command in a plan for review before approval.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn grade_match_batch(&self, Parameters(p): Parameters<MatchParams>) -> Result<CallToolResult, McpError> {
+        let clean = |mut v: Value| {
+            if let Some(o) = v.as_object_mut() {
+                o.retain(|_, v| !v.is_null());
+            }
+            v
+        };
+        let reference = clean(json!({"clip":p.reference.clip,"sequence":p.reference.sequence,"item":p.reference.item,"frames":p.reference.frames}));
+        let targets: Vec<Value> =
+            p.targets.into_iter().map(|a| clean(json!({"clip":a.clip,"sequence":a.sequence,"effectInstance":a.effect_instance,"frames":a.frames}))).collect();
+        let mode = p.mode.map(|m| match m {
+            MatchMode::Full => "full",
+            MatchMode::Exposure => "exposure",
+            MatchMode::WhiteBalance => "white_balance",
+        });
+        wrap(
+            self.run(
+                "grade.matchBatch",
+                json!({"reference":reference,"targets":targets,"expectedRevision":p.expected_revision,"mode":mode,
+            "samplesPerClip":p.samples_per_clip,"minConfidence":p.min_confidence,"skinProtection":p.skin_protection,"replaceKeyframes":p.replace_keyframes}),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Measure subject scopes",
+        description = "Measure source media, an isolated clip or composite before/after effects at exact frames, optionally within a normalized ROI and against a reference. Returns declared color-space values, clipping metrics and reference deltas. Can measure staged plans without applying them.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn scopes_read(&self, Parameters(p): Parameters<ScopesParams>) -> Result<CallToolResult, McpError> {
+        let target = p.target.map(|v| match v {
+            RenderTarget::Sequence => "sequence",
+            RenderTarget::Clip => "clip",
+            RenderTarget::Source => "source",
+        });
+        let effects = p.effects.map(|v| match v {
+            Effects::Pre => "pre",
+            Effects::Post => "post",
+        });
+        let roi = p.roi.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height}));
+        let r = self
+            .run(
+                "scopes.read",
+                json!({"target":target,"sequence":p.sequence,"clip":p.clip,"item":p.item,"frames":p.frames,"times":p.times,
+            "effects":effects,"roi":roi,"reference":p.reference,"plan":p.plan,"colorSpace":p.color_space,"images":p.images,"bins":p.bins,"scopes":p.scopes}),
+            )
+            .await;
+        Ok(match r {
+            Ok(v) => frame_contents(v),
+            Err(e) => fail(e),
+        })
     }
 
     #[tool(
@@ -373,6 +702,9 @@ impl FilmcraftMcp {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn command_batch(&self, Parameters(p): Parameters<BatchParams>) -> Result<CallToolResult, McpError> {
+        if p.steps.len() > 256 {
+            return Ok(fail("command_batch accepts at most 256 steps; use separate reviewed plans"));
+        }
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
         for st in p.steps {
@@ -405,7 +737,7 @@ impl FilmcraftMcp {
 
     #[tool(
         title = "Render a preview",
-        description = "The active sequence's frame at `seconds` (default: the playhead) as PNG, same as render_frame (bridge mode: Program monitor screenshot).",
+        description = "The active sequence's frame at `seconds` (default: the playhead) as PNG, same deterministic snapshot path as render_frame.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn render_preview(&self, p: Parameters<RenderParams>) -> Result<CallToolResult, McpError> {
@@ -445,57 +777,17 @@ impl FilmcraftMcp {
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn render_frame(&self, Parameters(p): Parameters<RenderParams>) -> Result<CallToolResult, McpError> {
-        let max = p.max_side.unwrap_or(960);
-        match &*self.backend {
-            Backend::Headless(s) => {
-                let s = s.clone();
-                let r = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, AutomationError> {
-                    let g = s.lock().unwrap_or_else(PoisonError::into_inner);
-                    // read-only: render at `seconds` without moving the playhead (#114)
-                    let t = p.seconds.map_or_else(|| g.playhead(), filmcraft_time::Tick::from_seconds_f64);
-                    let (w, h) =
-                        g.active_sequence().map(|q| (q.settings.width, q.settings.height)).ok_or_else(|| AutomationError::Other("no sequence".into()))?;
-                    let scale = render_scale(max, w, h);
-                    let img = g.try_render_program_at(scale, t).map_err(|e| AutomationError::Other(e.to_string()))?;
-                    png_rgba(img.w as u32, img.h as u32, img.over_black_rgba8(), max)
-                })
-                .await
-                .unwrap_or_else(|e| Err(join_error(e)));
-                Ok(match r {
-                    Ok(png) => png_result(&png, "rendered frame"),
-                    Err(e) => fail(e),
-                })
+        let mut params = json!({"maxSide":p.max_side.unwrap_or(960)});
+        if let Some(seconds) = p.seconds {
+            if !seconds.is_finite() || seconds < 0.0 || seconds > filmcraft_time::Tick::MAX.seconds() {
+                return Ok(fail("seconds must be finite, nonnegative and within the timeline range"));
             }
-            Backend::Bridge(b) => {
-                // held until the playhead is back, also for the no-`seconds` screenshot, which must not catch another call's seek
-                let _turn = self.render_lock.lock().await;
-                let Some(sec) = p.seconds else {
-                    return self.screenshot(&b.clone(), Some("Program".into()), max).await;
-                };
-                // The Program monitor shows the playhead's frame, so the live playhead has to move
-                // for the screenshot; put it (and the selection, which may follow it) back after,
-                // so the tool stays read-only (#114).
-                let before = match self.run("sequence.inspect", json!({})).await {
-                    Ok(v) => v,
-                    Err(e) => return Ok(fail(e)),
-                };
-                if let Err(e) = self.run("playhead.set", json!({"seconds": sec})).await {
-                    return Ok(fail(e));
-                }
-                let shot = self.screenshot(&b.clone(), Some("Program".into()), max).await;
-                if let Some(t) = before.get("playhead").and_then(Value::as_i64) {
-                    let _ = self.run("playhead.set", json!({"time": t})).await;
-                }
-                // only when it changed: selecting also leaves trim mode
-                let now = self.run("sequence.inspect", json!({})).await.ok();
-                if let Some(sel) = before.get("selection").filter(|v| v.is_array())
-                    && now.as_ref().and_then(|n| n.get("selection")) != Some(sel)
-                {
-                    let _ = self.run("timeline.select", json!({"clips": sel})).await;
-                }
-                shot
-            }
+            params["times"] = json!([filmcraft_time::Tick::from_seconds_f64(seconds).0]);
         }
+        Ok(match self.run("render.frames", params).await {
+            Ok(v) => frame_contents(v),
+            Err(e) => fail(e),
+        })
     }
 
     #[tool(
@@ -585,19 +877,17 @@ impl FilmcraftMcp {
 
 impl FilmcraftMcp {
     async fn screenshot(&self, b: &BridgeClient, panel: Option<String>, max: u32) -> Result<CallToolResult, McpError> {
-        // The desktop bridge needs a pathname, so use a freshly-created,
-        // owner-only directory rather than exposing image bytes at a
-        // predictable shared-temp filename.
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
+        let result = match b.call("ui.screenshot", json!({"panel":panel})).await {
+            Ok(v) => v,
             Err(e) => return Ok(fail(format!("screenshot: {e}"))),
         };
-        let path = dir.path().join("screenshot.png");
-        if let Err(e) = b.call("ui.screenshot", json!({"path": path.to_string_lossy(), "panel": panel})).await {
-            return Ok(fail(e));
-        }
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
+        let bytes = match result
+            .get("pngBase64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AutomationError::Bridge("app did not return inline screenshot bytes".into()))
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).map_err(|e| AutomationError::Bridge(e.to_string())))
+        {
+            Ok(v) => v,
             Err(e) => return Ok(fail(format!("screenshot: {e}"))),
         };
         let bytes = match image::load_from_memory(&bytes) {
@@ -624,7 +914,7 @@ impl FilmcraftMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "FilmCraft video editor (Premiere Pro-class). Every edit is an engine command: `command_list` to discover ids/params, `command_run` to execute (undoable; `command_batch` runs several). `doc_inspect` (or `project_inspect`/`sequence_inspect`) returns ids you can pass to commands; `render_preview` shows the result. In bridge mode the `ui_*` tools drive the live app: `ui_elements` lists clickable ids, `ui_click`/`ui_drag`/`ui_key` operate it, `ui_screenshot` shows it. Time is in ticks: 254016000000 per second (commands also accept `seconds`, `frame` or `timecode`).";
+const INSTRUCTIONS: &str = "FilmCraft: inspect -> propose -> preview -> apply -> verify. Start with agent_session and inspect (doc_inspect also returns the project tree). Build eligible in-memory edits with plan_edit, inspect preview_plan, then render_frames with plan/comparison and scopes.read. Apply only the user-approved plan using apply_plan with stable operation_id/idempotency_key/session_id; verify the receipt, affected IDs, scopes and frames. A stale plan must be rebuilt. Resolve lost replies with get_operation; unknown_commit never means safe to repeat a write under another ID. command_run and UI tools remain advanced direct editing tools and require Edit permission. File writes and jobs stay outside edit plans. Time is exact ticks (254016000000/s) or frame indexes.";
 
 /// Resources: the project (as `doc_inspect`) and the command catalog (as `command_list`).
 const DOCUMENT_URI: &str = "filmcraft://document";
@@ -709,14 +999,6 @@ impl ServerHandler for FilmcraftMcp {
         }
         Ok(r.into())
     }
-}
-
-/// Render scale that fits the longest side of a `w` x `h` sequence into `max_side` (never upscales; 0 = no limit, as in `png_rgba`).
-fn render_scale(max_side: u32, w: u32, h: u32) -> f32 {
-    if max_side == 0 {
-        return 1.0;
-    }
-    (max_side as f32 / w.max(h).max(1) as f32).min(1.0)
 }
 
 #[cfg(test)]

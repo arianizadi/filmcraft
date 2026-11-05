@@ -58,7 +58,7 @@ echo "==> FilmCraft $VERSION for macOS ($ARCH), identity: $IDENTITY, notarize: $
 if [[ "$SKIP_BUILD" = 0 ]]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
-  (cd "$ROOT" && cargo build --release --locked -p filmcraft -p filmcraft-cli "${args[@]}")
+  (cd "$ROOT" && cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/whisper,filmcraft-cli/whisper "${args[@]}")
 fi
 
 rm -rf "$WORK"
@@ -118,14 +118,18 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Executable and icon carry the display name (CFBundleExecutable / CFBundleIconFile).
 cp "$WORK/bin/filmcraft" "$APP/Contents/MacOS/FilmCraft"
 cp "$ROOT/assets/app-icon/filmcraft.icns" "$APP/Contents/Resources/FilmCraft.icns"
-cp "$ROOT/NOTICE" "$APP/Contents/Resources/"
+copy_docs "$APP/Contents/Resources"
+cp "$ROOT/ATTRIBUTION.md" "$APP/Contents/Resources/"
+cp "$ROOT/assets/app-icon/LICENSE.txt" "$APP/Contents/Resources/FilmCraft-icon-LICENSE.txt"
+for font_license in "$ROOT"/assets/fonts/OFL-*.txt; do
+  [[ -f "$font_license" ]] && cp "$font_license" "$APP/Contents/Resources/"
+done
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
   -e "s/@BUILD_SHA@/${FILMCRAFT_BUILD_SHA:-unknown}/g" \
   "$HERE/Info.plist.in" >"$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
-# licences of the embedded craft-fonts fonts (builds with CRAFT_FONTS_DIR)
-copy_font_licences "$APP/Contents/Resources"
+# Embedded craft-fonts licenses were included by copy_docs above.
 
 # Sign inside-out: nested code first, then the bundle itself (no --deep on the final signature).
 # Today the only nested code is the main executable; frameworks/helpers would be signed here too.

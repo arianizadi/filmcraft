@@ -54,6 +54,22 @@ fn hostile_frame_rates_are_rejected_before_frame_arithmetic() {
 }
 
 #[test]
+fn high_frame_rates_and_eight_k_preserve_exact_boundaries() {
+    for (width, height, frame_rate) in [
+        (7680, 4320, FrameRate::FPS_60),
+        (7680, 4320, FrameRate::FPS_59_94),
+        (1920, 1080, FrameRate::new(960, 1)),
+        (1920, 1080, FrameRate::new(2000, 1)),
+        (1920, 1080, FrameRate::new(1_234_567, 1001)),
+    ] {
+        SequenceSettings { width, height, frame_rate, ..Default::default() }.validate().unwrap();
+        for frame in [0, 1, 959, 960, 960_000, 123_456_789] {
+            assert_eq!(frame_rate.frame_at(frame_rate.tick_of(frame)), frame);
+        }
+    }
+}
+
+#[test]
 fn corrupt_timeline_times_are_rejected_before_end_arithmetic() {
     let (mut project, media, seq) = demo_project();
     let rate = project.sequence(seq).unwrap().settings.frame_rate;

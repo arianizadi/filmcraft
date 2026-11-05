@@ -11,7 +11,7 @@
 //! state, sequence settings, media info, generators) round-trip through `metadata.filmcraft`.
 //! Nested sequences are `Stack` items inside tracks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use filmcraft_media::{Generator, MediaInfo};
 use filmcraft_project::{
@@ -440,13 +440,107 @@ fn collect_timelines<'v>(v: &'v Value, out: &mut Vec<&'v Value>) {
     }
 }
 
-/// The rate of the first item a sequence can run at. Items at an audio sample rate (a gap or
-/// clip at 48000 is valid OTIO) are skipped: no sequence runs at 48000 fps.
-fn first_rate(v: &Value) -> Option<FrameRate> {
-    if let Some(sr) = v.get("source_range").filter(|s| !s.is_null()) {
-        return sr.get("duration").and_then(read_rate).filter(|&r| sequence_rate(r));
+/// RationalTime specifies a clock, not whether its units are video frames or audio samples.
+/// Infer from track/clip semantics, never from a numeric maximum shared with sequence validation.
+#[derive(Default)]
+struct RateEvidence {
+    video_media: Option<FrameRate>,
+    video_timing: Option<FrameRate>,
+    video_gap: Option<FrameRate>,
+    audio: HashSet<FrameRate>,
+}
+
+fn active_reference(c: &Value) -> Option<&Value> {
+    match c.get("media_references") {
+        Some(refs) => {
+            let key = c.get("active_media_reference_key").and_then(Value::as_str).unwrap_or("DEFAULT_MEDIA");
+            refs.get(key).or_else(|| refs.as_object().and_then(|o| o.values().next()))
+        }
+        None => c.get("media_reference"),
     }
-    v.get("children").and_then(Value::as_array).into_iter().flatten().find_map(first_rate)
+}
+
+fn source_clock(v: &Value) -> Option<FrameRate> {
+    v.get("source_range")
+        .and_then(|r| r.get("duration"))
+        .and_then(read_rate)
+        .or_else(|| active_reference(v).and_then(|r| r.get("available_range")).and_then(|r| r.get("duration")).and_then(read_rate))
+        .filter(|&rate| sequence_rate(rate))
+}
+
+fn video_media_rate(v: &Value) -> Option<FrameRate> {
+    let rate: FrameRate = serde_json::from_value(fc(active_reference(v)?)?.get("info")?.get("video")?.get("frame_rate")?.clone()).ok()?;
+    sequence_rate(rate).then_some(rate)
+}
+
+impl RateEvidence {
+    fn collect(v: &Value) -> Self {
+        let mut evidence = Self::default();
+        evidence.visit(v, None, 0);
+        evidence
+    }
+
+    fn visit(&mut self, v: &Value, parent: Option<TrackKind>, depth: usize) {
+        // serde_json's default parser also limits nesting. Keep this helper bounded on its own.
+        if depth >= 128 {
+            return;
+        }
+        let kind = if parent == Some(TrackKind::Audio) {
+            // A nested picture stack used on an Audio track contributes sound here. Its own
+            // sequence inference starts separately at the stack and can still inspect video.
+            parent
+        } else if schema_name(v) == "Track" {
+            Some(if v.get("kind").and_then(Value::as_str) == Some("Audio") { TrackKind::Audio } else { TrackKind::Video })
+        } else {
+            parent
+        };
+        if kind == Some(TrackKind::Audio) {
+            if let Some(rate) = source_clock(v) {
+                self.audio.insert(rate);
+            }
+            if let Some(streams) = active_reference(v).and_then(fc).and_then(|m| m.get("info")).and_then(|i| i.get("audio_streams")).and_then(Value::as_array) {
+                for stream in streams {
+                    if let Some(rate) =
+                        stream.get("sample_rate").and_then(Value::as_u64).filter(|r| *r > 0 && *r <= MAX_RATE as u64).and_then(|r| i64::try_from(r).ok())
+                    {
+                        self.audio.insert(FrameRate::new(rate, 1));
+                    }
+                }
+            }
+        } else if kind == Some(TrackKind::Video) {
+            match schema_name(v) {
+                "Clip" => {
+                    self.video_media = self.video_media.or_else(|| video_media_rate(v));
+                    self.video_timing = self.video_timing.or_else(|| source_clock(v));
+                }
+                "Gap" => self.video_gap = self.video_gap.or_else(|| source_clock(v)),
+                _ => {}
+            }
+        }
+        for child in v.get("children").and_then(Value::as_array).into_iter().flatten() {
+            self.visit(child, kind, depth.saturating_add(1));
+        }
+    }
+
+    fn picture(&self) -> Option<FrameRate> {
+        self.video_media.or(self.video_timing)
+    }
+
+    fn fallback(&self) -> Option<FrameRate> {
+        self.picture().or_else(|| self.video_gap.filter(|rate| !self.audio.contains(rate)))
+    }
+
+    fn global(&self, rate: FrameRate) -> Option<FrameRate> {
+        // A picture clip at the same rate is positive video evidence, even for unusual HFR
+        // rates that coincide numerically with audio clocks. Otherwise an audio clock does not
+        // override a picture frame rate or become an audio-only sequence's display frame rate.
+        (!self.audio.contains(&rate) || self.picture() == Some(rate)).then_some(rate)
+    }
+}
+
+/// Nested stacks infer their own picture rate rather than inheriting a parent source-range clock.
+fn first_rate(v: &Value) -> Option<FrameRate> {
+    RateEvidence::collect(v).fallback()
 }
 
 fn sequence_rate(rate: FrameRate) -> bool {
@@ -502,7 +596,15 @@ impl Imp<'_, '_> {
         let meta = fc(tl).or_else(|| fc(stack));
         self.merge_palette(meta);
 
-        let rate = tl.get("global_start_time").and_then(read_rate).filter(|&r| sequence_rate(r)).or_else(|| first_rate(stack)).unwrap_or_default();
+        let saved_settings = meta.and_then(|m| m.get("settings")).and_then(|v| serde_json::from_value::<SequenceSettings>(v.clone()).ok());
+        let evidence = RateEvidence::collect(stack);
+        let global = tl.get("global_start_time").and_then(read_rate).filter(|&r| sequence_rate(r));
+        let global=global.and_then(|rate| {
+            let accepted=evidence.global(rate);
+            if accepted.is_none() && saved_settings.is_none() {self.report.warn(format!("OTIO global start uses the audio clock {rate}; the sequence frame rate was inferred from picture clips (or uses the default display frame rate when no picture rate is available). Exact times were retained; metadata.filmcraft.settings can specify an explicit sequence timebase."));}
+            accepted
+        });
+        let rate = global.or_else(|| evidence.fallback()).unwrap_or_default();
         let id = self.sequence(stack, &name, meta, rate);
         if let Some(st) = tl.get("global_start_time").and_then(read_rt)
             && let Some(s) = self.b.p.sequence_mut(id)

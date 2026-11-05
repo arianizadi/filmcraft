@@ -1,12 +1,20 @@
 # Parity with Adobe Premiere Pro
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-30 · **Change:** minor (AVI import #650, E-AC-3 decode #647 and Russian menus #610 no longer counted as missing; percentages and hours not re-measured) · **Target:** Adobe Premiere Pro 2026 (26.5.2, macOS)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-04 · **Change:** minor (personal fork workflow documented; baseline estimates unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2, macOS)
 
 The authoritative assessment of how close FilmCraft is to Premiere Pro, and how much work is left.
 [ROADMAP.md](../ROADMAP.md) summarizes it; [gaps.md](gaps.md) lists every shortfall one at a time.
 The deep checklists are [file-format-parity.md](file-format-parity.md),
 [codec-parity.md](codec-parity.md), [hardware-parity.md](hardware-parity.md),
 [ui-parity.md](ui-parity.md) and [localization-parity.md](localization-parity.md).
+
+## Personal fork status — 2026-11-04
+
+The [reviewed agent workflow](agent-workflow.md) is now implemented and tested locally, including
+8K59.94/1080p960 timing and [stream-profile compatibility checks](format-compatibility.md).
+These results add concrete evidence for the fork's automation workflow; the upstream parity
+percentages and hour estimates below have not been remeasured.
+
 
 ## Headline
 

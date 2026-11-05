@@ -302,8 +302,12 @@ pub fn level_at_least(requested: u8, needed: u8) -> u8 {
     if VALID.contains(&requested) && requested >= needed { requested } else { needed }
 }
 
-/// Pick the lowest level satisfying frame size, macroblock rate, DPB size and (optionally) bitrate.
-pub fn pick_level(width_mbs: u32, height_mbs: u32, fps: f64, dpb_frames: u32, kbps: Option<u32>, high: bool) -> u8 {
+/// Pick the lowest implemented level satisfying frame size, exact macroblock rate, DPB size,
+/// and (optionally) bitrate. No supported level is an error, never a fallback level label.
+pub fn checked_level(width_mbs: u32, height_mbs: u32, fps: (u32, u32), dpb_frames: u32, kbps: Option<u32>, high: bool) -> Option<u8> {
+    if width_mbs == 0 || height_mbs == 0 || fps.0 == 0 || fps.1 == 0 || dpb_frames == 0 {
+        return None;
+    }
     // (level_idc, MaxMBPS, MaxFS, MaxDpbMbs, MaxBR kbit/s)
     const LEVELS: [(u8, u64, u64, u64, u64); 17] = [
         (10, 1485, 99, 396, 64),
@@ -324,14 +328,16 @@ pub fn pick_level(width_mbs: u32, height_mbs: u32, fps: f64, dpb_frames: u32, kb
         (52, 2073600, 36864, 184320, 240000),
         (62, 16711680, 139264, 696320, 800000),
     ];
-    let fs = (width_mbs * height_mbs) as u64;
-    let mbps = (fs as f64 * fps).ceil() as u64;
+    let fs = u64::from(width_mbs) * u64::from(height_mbs);
+    let mbps_numerator = u128::from(fs) * u128::from(fps.0);
     for &(l, max_mbps, max_fs, max_dpb, max_br) in &LEVELS {
         let br_ok = kbps.is_none_or(|k| (k as u64) * 1000 <= max_br * if high { 1250 } else { 1000 });
         let dim_ok = (width_mbs as u64).pow(2) <= 8 * max_fs && (height_mbs as u64).pow(2) <= 8 * max_fs;
-        if fs <= max_fs && mbps <= max_mbps && fs * dpb_frames as u64 <= max_dpb && br_ok && dim_ok {
-            return l;
+        let rate_ok = mbps_numerator <= u128::from(max_mbps) * u128::from(fps.1);
+        let dpb_ok = u128::from(fs) * u128::from(dpb_frames) <= u128::from(max_dpb);
+        if fs <= max_fs && rate_ok && dpb_ok && br_ok && dim_ok {
+            return Some(l);
         }
     }
-    62
+    None
 }

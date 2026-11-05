@@ -14,5 +14,6 @@ mod mp4_rtmd;
 mod mpeg_oracle;
 mod mxf_oracle;
 mod ogg_oracle;
+mod raw_dolby;
 mod rf64_metadata;
 mod y4m_file;

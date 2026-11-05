@@ -32,6 +32,7 @@ pub mod mp4;
 pub mod mpeg;
 pub mod mxf;
 pub mod ogg;
+mod raw_dolby;
 mod stream_color;
 pub mod video;
 mod webm_alpha;
@@ -159,6 +160,7 @@ fn reader_registry() -> &'static RwLock<Vec<filmcraft_media::ReaderOpener>> {
             apv::reader_opener,
             y4m::reader_opener,
             avi::reader_opener,
+            audio::raw_dolby_reader_opener,
         ])
     })
 }

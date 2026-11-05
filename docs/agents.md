@@ -1,5 +1,10 @@
 # Agents
 
+The preferred agent workflow is now **inspect → propose → preview → apply → verify**.
+See [agent-workflow.md](agent-workflow.md) for operation receipts, immutable plans, the Agent Review
+window and launcher, and [visual-inspection.md](visual-inspection.md) for snapshot renders/scopes.
+The older direct-edit tools below remain available with Edit permission.
+
 FilmCraft is built to be driven by AI agents, and largely built by them. Part 1 covers using
 FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 
@@ -83,7 +88,7 @@ claude mcp add filmcraft -- filmcraft-cli mcp
 | `project_inspect` | both | bins and items with ids, types, durations; active sequence |
 | `sequence_inspect` | both | the active sequence: tracks, clips (`start` / `end` and `sourceIn` / `sourceOut` in ticks, frames, `speed`, `reverse`: the clip plays its `sourceIn` to `sourceOut` stretch backward, `gainDb`), effects, transitions, markers (name and `comment`), playhead, selection |
 | `media_import` | both | import files by absolute path (`paths`, an array; optional `bin`, `image_sequence`) |
-| `render_frame` | both | PNG of the program frame at `seconds` (headless renders; bridge screenshots the Program monitor). Read-only: the playhead and selection are left as they were. Parallel bridge calls take turns, so each returns its own frame |
+| `render_frame` | both | PNG of the program frame at `seconds` (both modes render the same immutable project snapshot). Read-only: the playhead and selection are left as they were. Parallel bridge calls take turns, so each returns its own frame |
 | `ui_inspect` | bridge | UI state: tool, workspace, panels, zoom, playback, fps |
 | `ui_elements` | bridge | on-screen interactive elements with id, label and rect (`prefix` filter) |
 | `ui_click` | bridge | click by `id` or `x`,`y`; `button`, `count`, `modifiers` |

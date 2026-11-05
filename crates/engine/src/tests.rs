@@ -169,7 +169,7 @@ fn sequence_parameters_are_bounded_and_failed_changes_are_atomic() {
             json!({"width":1.5}),
             json!({"width":32768,"height":16384}),
             json!({"width":1920.25}),
-            json!({"fps":1001}),
+            json!({"fps":4_294_967_296_u64}),
             json!({"sampleRate":384001}),
         ] {
             assert!(s.execute(command, params.clone()).is_err(), "{command} {params}");
@@ -1073,6 +1073,28 @@ fn fps_validation_keeps_real_rates_and_refuses_degenerate_ones() {
     assert!(s.execute("sequence.settings", json!({"fps": -0.0})).is_err());
     assert_eq!(s.sequence_rate(), before);
     assert_eq!(s.execute("project.inspect", json!({})).unwrap().to_string().len(), n, "no sequence was created");
+}
+
+#[test]
+fn sequence_commands_accept_exact_custom_rates_and_reject_bad_rationals() {
+    let mut s = Session::default();
+    s.execute("file.newSequence", json!({"name":"8K60","width":7680,"height":4320,"frameRate":{"num":60000,"den":1001}})).unwrap();
+    assert_eq!(s.sequence_rate(), FrameRate::FPS_59_94);
+    for (num, den) in [(960, 1), (2000, 1), (1_234_567, 1001)] {
+        s.execute("sequence.settings", json!({"frameRate":{"num":num,"den":den}})).unwrap();
+        assert_eq!(s.sequence_rate(), FrameRate::new(num, den));
+    }
+    for p in [
+        json!({"fps":"960"}),
+        json!({"fps":960,"frameRate":{"num":960,"den":1}}),
+        json!({"frameRate":{"num":1,"den":0}}),
+        json!({"frameRate":{"num":-1,"den":1}}),
+        json!({"frameRate":{"num":u64::MAX,"den":1}}),
+    ] {
+        let before = s.revision;
+        assert!(s.execute("sequence.settings", p).is_err());
+        assert_eq!(s.revision, before);
+    }
 }
 
 /// #164: with a clip selected, Q/W trim only its tracks (and its linked sound), not every

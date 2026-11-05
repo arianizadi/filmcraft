@@ -68,7 +68,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             "lumetri.applyMatch",
             "Apply Match",
             &[],
-            r#"{"clip":id?,"referenceTime":ticks?|"referenceFrame":n?|"referenceTimecode":str?,"faceDetection":bool=true}"#,
+            r#"{"clip":id?,"referenceTime":ticks?|"referenceFrame":n?|"referenceTimecode":str?,"faceDetection":bool=true,"replaceKeyframes":bool=false}"#,
             has_seq,
             apply_match,
         ),
@@ -446,28 +446,108 @@ fn preset_thumbnails(s: &mut Session, p: &Value) -> Result<Value> {
 /// clip at the playhead to the sequence frame at the reference time. Sets the three wheels, their
 /// lightness and Basic saturation in one undo step.
 fn apply_match(s: &mut Session, p: &Value) -> Result<Value> {
-    let (clip, idx) = lumetri_clip(s, p, "lumetri.applyMatch")?;
-    let seq_id = s.state.active_sequence.ok_or_else(|| bad("lumetri.applyMatch", "no active sequence"))?;
-    let reference_t = time_p(s, p, "reference").ok_or_else(|| bad("lumetri.applyMatch", "need `referenceTime`, `referenceFrame` or `referenceTimecode`"))?;
-    let skin = bool_p(p, "faceDetection").unwrap_or(true);
-    let q = s.active_sequence().ok_or_else(|| bad("lumetri.applyMatch", "no active sequence"))?;
-    let (_, it) = q.find_item(clip).ok_or_else(|| bad("lumetri.applyMatch", "no such clip"))?;
-    let t = s.playhead().clamp(it.start, it.end() - filmcraft_time::Tick(1));
+    const CMD: &str = "lumetri.applyMatch";
+    // Validate everything before creating a missing effect. Previously a rejected reference
+    // still added Lumetri and polluted both the project and undo history.
+    let seq_id = s.state.active_sequence.ok_or_else(|| bad(CMD, "no active sequence"))?;
+    let settings = &s.active_sequence().ok_or_else(|| bad(CMD, "no active sequence"))?.settings;
+    settings.validate().map_err(|e| bad(CMD, e))?;
+    // The matcher evaluates candidates through the SDR grading math and Oklab in BT.709.
+    // Relabelling a Rec.2020 working image, or merely converting its samples, would still solve
+    // controls for the wrong grading transfer function when applied back to an HDR timeline.
+    if !settings.color.is_plain() {
+        return Err(bad(CMD, "HDR and wide-gamut working-space matching is unsupported; no grade was changed"));
+    }
+    let reference_t = time_p(s, p, "reference").ok_or_else(|| bad(CMD, "need `referenceTime`, `referenceFrame` or `referenceTimecode`"))?;
+    let skin = match p.get("faceDetection") {
+        None => true,
+        Some(v) => v.as_bool().ok_or_else(|| bad(CMD, "faceDetection must be boolean"))?,
+    };
+    let replace = match p.get("replaceKeyframes") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| bad(CMD, "replaceKeyframes must be boolean"))?,
+    };
+    let q = s.active_sequence().ok_or_else(|| bad(CMD, "no active sequence"))?;
+    let is_video = |clip: &ClipId| q.find_item(*clip).is_some_and(|(t, _)| q.track(t).is_some_and(|t| t.kind == TrackKind::Video));
+    let clip = match p.get("clip") {
+        Some(v) => ClipId(v.as_u64().ok_or_else(|| bad(CMD, "clip must be an unsigned integer"))?),
+        None => s
+            .state
+            .selection
+            .iter()
+            .copied()
+            .filter(is_video)
+            .find(|c| q.find_item(*c).is_some_and(|(_, it)| it.effects.iter().any(|e| e.effect == "lumetri")))
+            .or_else(|| s.state.selection.iter().copied().find(is_video))
+            .ok_or_else(|| bad(CMD, "select a video clip"))?,
+    };
+    let (track, it) = q.find_item(clip).ok_or_else(|| bad(CMD, "no such clip"))?;
+    let track = q.track(track).ok_or_else(|| bad(CMD, "no such track"))?;
+    if track.kind != TrackKind::Video || track.locked {
+        return Err(bad(CMD, "target must be a video clip on an unlocked track"));
+    }
+    if it.duration <= filmcraft_time::Tick::ZERO {
+        return Err(bad(CMD, "target clip has no positive duration"));
+    }
+    if reference_t < filmcraft_time::Tick::ZERO || reference_t >= q.duration() {
+        return Err(bad(CMD, "reference is outside the sequence"));
+    }
     if it.range().contains(reference_t) {
-        return Err(bad("lumetri.applyMatch", "the reference frame is inside the clip being matched; pick a frame from another shot"));
+        return Err(bad(CMD, "the reference frame is inside the clip being matched; pick a frame from another shot"));
     }
-    let base = it.effects[idx].clone();
-    // the current shot as Lumetri sees it: the clip with its Lumetri switched off
+    if !q.video_tracks.iter().any(|t| t.enabled && t.items.iter().any(|i| i.enabled && i.range().contains(reference_t))) {
+        return Err(bad(CMD, "reference frame is a video gap"));
+    }
+    let last = it
+        .start
+        .0
+        .checked_add(it.duration.0)
+        .and_then(|end| end.checked_sub(1))
+        .filter(|last| *last >= it.start.0)
+        .map(filmcraft_time::Tick)
+        .ok_or_else(|| bad(CMD, "invalid target range"))?;
+    let t = s.playhead().clamp(it.start, last);
+    let idx = it.effects.iter().position(|e| e.effect == "lumetri");
+    let base = match idx.and_then(|i| it.effects.get(i)).cloned() {
+        Some(effect) => effect,
+        None => filmcraft_project::find_effect("lumetri").ok_or_else(|| bad(CMD, "Lumetri unavailable"))?.instance(),
+    };
+    const KEYS: [&str; 9] = [
+        "wheel_shadows",
+        "wheel_midtones",
+        "wheel_highlights",
+        "wheel_shadows_l",
+        "wheel_midtones_l",
+        "wheel_highlights_l",
+        "saturation",
+        "wheels_on",
+        "basic_on",
+    ];
+    let animated: Vec<&str> = KEYS.iter().copied().filter(|k| base.params.get(*k).is_some_and(filmcraft_project::Param::is_animated)).collect();
+    if !animated.is_empty() && !replace {
+        return Err(bad(CMD, format!("affected parameters are animated: {}; set replaceKeyframes:true to replace their keyframes", animated.join(", "))));
+    }
     let mut probe = (*s.project).clone();
-    if let Some((_, pi)) = probe.sequence_mut(seq_id).and_then(|q| q.find_item_mut(clip)) {
-        pi.effects[idx].enabled = false;
+    if let Some(e) = probe.sequence_mut(seq_id).and_then(|q| q.find_item_mut(clip)).and_then(|(_, pi)| idx.and_then(|idx| pi.effects.get_mut(idx))) {
+        e.enabled = false;
     }
-    let provider = s.media.provider(s.project.clone(), s.services.clone());
+    let provider = s.media.full_res_provider(s.project.clone(), s.services.clone()).own_sources().recording();
     let opts = filmcraft_render::RenderOptions { scale: 0.25, working_output: true, ..Default::default() };
-    let current =
-        filmcraft_render::render_clip(&probe, seq_id, clip, t, opts, &provider).ok_or_else(|| bad("lumetri.applyMatch", "the clip has no picture"))?;
+    let current = filmcraft_render::render_clip(&probe, seq_id, clip, t, opts, &provider).ok_or_else(|| bad(CMD, "the clip has no picture"))?;
     let reference = filmcraft_render::render_sequence(&s.project, seq_id, reference_t, opts, &provider);
-    let m = filmcraft_render::color_match::solve(&current, &reference, &base, skin);
+    if !provider.offline_used().is_empty() {
+        return Err(bad(CMD, "match media is offline or unreadable; relink before matching"));
+    }
+    if current.px.is_empty() || reference.px.is_empty() {
+        return Err(bad(CMD, "could not render match frames"));
+    }
+    // Solve against the other controls at the actual frame, retaining their live animation.
+    let mut sample_base = base.clone();
+    for prm in sample_base.params.values_mut() {
+        prm.value = prm.value_at(it.effect_time_at(t));
+        prm.keyframes.clear();
+    }
+    let m = filmcraft_render::color_match::solve(&current, &reference, &sample_base, skin);
     let v2 = |a: [f32; 2]| ParamValue::Vec2(filmcraft_geom::Vec2::new(a[0] as f64, a[1] as f64));
     let values = [
         ("wheel_shadows", v2(m.shadows)),
@@ -478,22 +558,24 @@ fn apply_match(s: &mut Session, p: &Value) -> Result<Value> {
         ("wheel_highlights_l", ParamValue::Float(m.lightness[2] as f64)),
         ("saturation", ParamValue::Float(m.saturation as f64)),
         ("wheels_on", ParamValue::Bool(true)),
+        ("basic_on", ParamValue::Bool(true)),
     ];
     s.edit_sequence("Apply Match", |q, _, _| {
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
-        let e = it.effects.get_mut(idx).ok_or_else(|| bad("lumetri.applyMatch", "no Lumetri"))?;
+        let effect = if let Some(idx) = idx {
+            it.effects.get_mut(idx).ok_or_else(|| bad(CMD, "no Lumetri"))?
+        } else {
+            it.effects.push(base.clone());
+            it.effects.last_mut().ok_or_else(|| bad(CMD, "could not create Lumetri"))?
+        };
         for (k, v) in &values {
-            let prm = e.params.entry(k.to_string()).or_insert_with(|| filmcraft_project::Param::new(v.clone()));
+            let prm = effect.params.entry(k.to_string()).or_insert_with(|| filmcraft_project::Param::new(v.clone()));
             prm.keyframes.clear();
             prm.value = v.clone();
         }
-        e.enabled = true;
+        effect.enabled = true;
         Ok(())
     })?;
-    Ok(json!({
-        "clip": clip.0,
-        "shadows": m.shadows, "midtones": m.midtones, "highlights": m.highlights,
-        "lightness": m.lightness, "saturation": m.saturation,
-        "distanceBefore": m.before, "distanceAfter": m.after,
-    }))
+    Ok(json!({"clip":clip.0,"revision":s.revision,"shadows":m.shadows,"midtones":m.midtones,"highlights":m.highlights,
+        "lightness":m.lightness,"saturation":m.saturation,"distanceBefore":m.before,"distanceAfter":m.after,"replacedKeyframes":animated}))
 }

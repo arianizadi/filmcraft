@@ -491,6 +491,22 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
     if matches!(req.method.as_str(), "ui.click" | "ui.move" | "ui.drag" | "ui.scroll" | "ui.key" | "ui.type") && app.synthetic.len() >= MAX_SYNTHETIC_EVENTS {
         return err("too many synthetic input events are queued; wait for the current input to be processed");
     }
+    // A token authenticates a client; it does not grant permission to alter the timeline.
+    // Keep this gate at the common entry point so generic commands and synthetic input cannot bypass it.
+    if matches!(req.method.as_str(), "engine.execute" | "ui.menu.invoke") {
+        if let Some(id) = s("command").or(s("id"))
+            && let Err(e) = filmcraft_engine::operations::authorize(&app.session, id, p.get("params").unwrap_or(&Value::Null))
+        {
+            return err(e);
+        }
+    } else if !(matches!(
+        req.method.as_str(),
+        "engine.commands" | "ui.menu.list" | "ui.inspect" | "ui.docking" | "perf.stats" | "ui.elements" | "ui.timeline.hit" | "ui.timeline.locate"
+    ) || (req.method == "ui.screenshot" && p.get("path").is_none_or(Value::is_null)))
+        && app.session.operations.permission != filmcraft_engine::operations::Permission::Edit
+    {
+        return err("permission_denied: UI actions require Edit permission in the Agent Review window");
+    }
     match req.method.as_str() {
         "engine.execute" | "ui.menu.invoke" => {
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
@@ -707,8 +723,8 @@ pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, cr
             rgba.extend_from_slice(&[c.r(), c.g(), c.b(), 255]);
         }
     }
-    if cfg!(target_arch = "wasm32") {
-        // No filesystem on the web: the PNG comes back in the reply.
+    if cfg!(target_arch = "wasm32") || path.is_none() {
+        // Read-only captures return bytes directly; only an explicit output path writes a file.
         return match encode_png(&rgba, cw as u32, ch as u32) {
             Ok(png) => json!({"ok": true, "result": {"pngBase64": base64(&png), "width": cw, "height": ch}}),
             Err(e) => json!({"ok": false, "error": e}),
@@ -721,6 +737,18 @@ pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, cr
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },
         Err(e) => json!({"ok": false, "error": e}),
+    }
+}
+
+#[cfg(test)]
+mod inline_screenshot_tests {
+    #[test]
+    fn capture_without_output_path_returns_inline_png() {
+        let image = egui::ColorImage::filled([2, 2], egui::Color32::BLACK);
+        let result = super::save_screenshot_with_ppp(&image, None, None, 1.0);
+        assert_eq!(result["ok"], true);
+        assert!(result["result"]["pngBase64"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(result["result"].get("path").is_none());
     }
 }
 

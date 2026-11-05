@@ -285,9 +285,9 @@ fn collections_and_bare_tracks() {
 }
 
 /// An item may be at an audio sample rate: a 1.5 s gap written as 72 000 at rate 48 000 is valid
-/// OTIO, and so is a global start time at that rate. No sequence runs at 48 000 fps, so these do
-/// not set the sequence rate (it was 48 000, and importing the file into a project failed); the
-/// items keep their exact times.
+/// OTIO, and so is a global start time at that rate. Audio-track sampling clocks and gaps do
+/// not establish a picture frame rate. The items retain their exact times, independently of
+/// the sequence's ability to represent high video frame rates.
 #[test]
 fn items_at_a_sample_rate_do_not_set_the_sequence_rate() {
     let (sr, fps) = (48_000.0, 25.0);
@@ -312,6 +312,79 @@ fn items_at_a_sample_rate_do_not_set_the_sequence_rate() {
         assert_eq!((cam.start, cam.duration), (Tick(TICKS_PER_SECOND * 3 / 2), FrameRate::FPS_25.tick_of(100)));
         assert_eq!(s.audio_tracks[0].items[0].duration, Tick(TICKS_PER_SECOND * 10));
     }
+}
+
+fn sampling_clock_doc(fps: i64, global: Option<f64>, audio_first: bool) -> serde_json::Value {
+    use serde_json::json;
+    let range = |duration: f64, rate: f64| json!({"OTIO_SCHEMA":"TimeRange.1","start_time":{"OTIO_SCHEMA":"RationalTime.1","value":0,"rate":rate},"duration":{"OTIO_SCHEMA":"RationalTime.1","value":duration,"rate":rate}});
+    let picture = json!({"OTIO_SCHEMA":"Track.1","kind":"Video","children":[
+        {"OTIO_SCHEMA":"Gap.1","source_range":range(72_000.0,48_000.0)},
+        {"OTIO_SCHEMA":"Clip.2","name":"HFR Camera","source_range":range((fps*4) as f64,fps as f64),"media_reference":{"OTIO_SCHEMA":"MissingReference.1"}}
+    ]});
+    let audio = json!({"OTIO_SCHEMA":"Track.1","kind":"Audio","children":[
+        {"OTIO_SCHEMA":"Clip.2","name":"Recorder","source_range":range(480_000.0,48_000.0),"media_reference":{"OTIO_SCHEMA":"MissingReference.1"}}
+    ]});
+    json!({"OTIO_SCHEMA":"Timeline.1","name":"HFR and separate audio clocks","global_start_time":global.map(|rate|json!({"OTIO_SCHEMA":"RationalTime.1","value":3600.0*rate,"rate":rate})),
+        "tracks":{"OTIO_SCHEMA":"Stack.1","children":if audio_first{vec![audio,picture]}else{vec![picture,audio]}}})
+}
+
+#[test]
+fn high_video_rates_are_selected_by_picture_evidence_not_an_audio_clock_or_gap() {
+    for fps in [960i64, 2000, 48_000] {
+        for global in [None, Some(48_000.0)] {
+            for audio_first in [false, true] {
+                let doc = sampling_clock_doc(fps, global, audio_first);
+                let (imp, report) = import(&serde_json::to_vec(&doc).unwrap(), Format::Otio, None).unwrap();
+                let sequence = imp.project.sequence(only_seq(&imp)).unwrap();
+                assert_eq!(sequence.settings.frame_rate, FrameRate::new(fps, 1), "{fps}, {global:?}, {audio_first}: {report}");
+                sequence.settings.validate().unwrap();
+                let clip = &sequence.video_tracks[0].items[0];
+                assert_eq!((clip.start, clip.duration), (Tick(TICKS_PER_SECOND * 3 / 2), Tick(TICKS_PER_SECOND * 4)));
+                assert_eq!(sequence.audio_tracks[0].items[0].duration, Tick(TICKS_PER_SECOND * 10));
+                assert_eq!(sequence.start_timecode, if global.is_some() { 3600 * fps } else { 0 });
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_sequence_timebase_and_media_frame_metadata_keep_distinct_roles() {
+    use serde_json::json;
+    let mut doc = sampling_clock_doc(960, Some(25.0), true);
+    let (imp, _) = import(&serde_json::to_vec(&doc).unwrap(), Format::Otio, None).unwrap();
+    assert_eq!(
+        imp.project.sequence(only_seq(&imp)).unwrap().settings.frame_rate,
+        FrameRate::FPS_25,
+        "a genuine global video timebase wins over source-frame rate"
+    );
+
+    // Source ranges can themselves be normalized to the audio clock. Video stream metadata
+    // still identifies the camera's frame rate, including when the audio track appears first.
+    doc["global_start_time"] = json!({"OTIO_SCHEMA":"RationalTime.1","rate":48_000,"value":172_800_000});
+    let clip = &mut doc["tracks"]["children"][1]["children"][1];
+    clip["source_range"]["duration"]["rate"] = json!(48_000);
+    clip["source_range"]["duration"]["value"] = json!(192_000);
+    clip["source_range"]["start_time"]["rate"] = json!(48_000);
+    clip["media_reference"]["metadata"] = json!({"filmcraft":{"info":media_info("HFR Camera",true,false,FrameRate::new(960,1),10)}});
+    let (imp, _) = import(&serde_json::to_vec(&doc).unwrap(), Format::Otio, None).unwrap();
+    assert_eq!(imp.project.sequence(only_seq(&imp)).unwrap().settings.frame_rate, FrameRate::new(960, 1));
+
+    let settings = filmcraft_project::SequenceSettings { frame_rate: FrameRate::new(2000, 1), ..Default::default() };
+    doc["metadata"] = json!({"filmcraft":{"settings":settings}});
+    let (imp, _) = import(&serde_json::to_vec(&doc).unwrap(), Format::Otio, None).unwrap();
+    assert_eq!(imp.project.sequence(only_seq(&imp)).unwrap().settings.frame_rate, FrameRate::new(2000, 1), "saved sequence settings remain authoritative");
+}
+
+#[test]
+fn audio_only_sampling_clock_defaults_the_display_rate_without_retiming_audio() {
+    let mut doc = sampling_clock_doc(960, Some(48_000.0), true);
+    doc["tracks"]["children"].as_array_mut().unwrap().truncate(1);
+    let (imp, report) = import(&serde_json::to_vec(&doc).unwrap(), Format::Otio, None).unwrap();
+    let sequence = imp.project.sequence(only_seq(&imp)).unwrap();
+    assert_eq!(sequence.settings.frame_rate, FrameRate::default());
+    assert_eq!(sequence.audio_tracks[0].items[0].duration, Tick(TICKS_PER_SECOND * 10));
+    assert_eq!(sequence.start_timecode, FrameRate::default().frame_at(Tick(3600 * TICKS_PER_SECOND)));
+    assert!(report.to_string().contains("audio clock"), "{report}");
 }
 
 fn palette_collection(first: serde_json::Value, second: serde_json::Value) -> serde_json::Value {

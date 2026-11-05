@@ -905,6 +905,28 @@ impl AudioFileSource {
             };
             return Ok(Self { info, rate, samples });
         }
+        if crate::raw_dolby::extension(name) {
+            let (header, samples) = crate::raw_dolby::decode(&bytes)?;
+            let frames = samples.first().map_or(0, Vec::len);
+            let frames = i64::try_from(frames).map_err(|_| CodecError::Decode("raw Dolby sample count overflow".into()))?;
+            let codec = if header.is_eac3() { "E-AC-3" } else { "AC-3" };
+            let info = MediaInfo {
+                name: name.to_string(),
+                kind: MediaKind::AudioOnly,
+                duration: Tick::from_units(frames, i64::from(header.sample_rate)),
+                video: None,
+                audio_streams: vec![AudioStreamInfo {
+                    sample_rate: header.sample_rate,
+                    channels: header.channels() as u32,
+                    codec: codec.into(),
+                    bits_per_sample: None,
+                }],
+                container: format!("{codec} elementary stream"),
+                start_timecode: None,
+                file_size: Some(bytes.len() as u64),
+            };
+            return Ok(Self { info, rate: header.sample_rate, samples });
+        }
         let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.clone())), Default::default());
         let mut hint = Hint::new();
         hint.with_extension(&ext);
@@ -1126,16 +1148,25 @@ impl MediaSource for AudioFileSource {
         Err(MediaError::NoStream("video"))
     }
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> std::result::Result<AudioBuffer, MediaError> {
+        filmcraft_media::bounded_audio_dimensions(sample_rate, self.samples.len() as u32)?;
+        filmcraft_media::validate_audio_buffer_shape(self.samples.len(), frames)?;
+        let count = i64::try_from(frames).map_err(|_| MediaError::Decode("audio read length overflows".into()))?;
+        start.checked_add(count).ok_or_else(|| MediaError::Decode("audio read position overflows".into()))?;
         Ok(read_resampled(&self.samples, self.rate, start, frames, sample_rate))
     }
 }
 
 pub fn opener(name: &str, bytes: Arc<[u8]>) -> Option<std::result::Result<SharedSource, MediaError>> {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    if !matches!(ext.as_str(), "mp3" | "mp2" | "aac" | "flac" | "ogg" | "oga" | "aif" | "aiff" | "aifc") {
+    if !matches!(ext.as_str(), "mp3" | "mp2" | "aac" | "flac" | "ogg" | "oga" | "aif" | "aiff" | "aifc" | "ac3" | "eac3" | "ec3") {
         return None;
     }
     Some(AudioFileSource::decode(name, bytes).map(|s| Arc::new(s) as SharedSource).map_err(Into::into))
+}
+
+/// Streaming-reader entry for bounded standalone Dolby audio imports.
+pub fn raw_dolby_reader_opener(name: &str, _: &[u8], reader: &filmcraft_media::SharedReader) -> Option<std::result::Result<SharedSource, MediaError>> {
+    crate::raw_dolby::reader_opener(name, reader)
 }
 
 #[cfg(test)]

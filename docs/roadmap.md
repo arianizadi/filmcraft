@@ -1,11 +1,21 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-30 · **Change:** minor (M8: Fujifilm F-Log / F-Log2 / F-Log2 C colour spaces; E-AC-3 #788, AVI #650, Russian #610, French #804, Indonesian #878, pt-BR #866 and German #630 no longer listed as open) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-11-04 · **Change:** minor (personal fork workflow documented; baseline estimates unchanged) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Forward-looking plan: milestones with status, the current focus and what's next, with estimates in
 Opus 5.5 agent-hours (calibration in [target-app-parity.md](target-app-parity.md#calibration)).
 The one-page summary is [ROADMAP.md](../ROADMAP.md); the ranked work list is [gaps.md](gaps.md).
 There is no `cargo xtask scorecard` or `cargo xtask parity` yet ([G7](gaps.md#g7-no-measured-parity-tool-in-ci)).
+
+## Personal fork milestone — 2026-11-04
+
+The first agent workflow is implemented: inspect → propose → preview → apply → verify, with
+retry-safe receipts, revision-guarded immutable plans, typed grades, batch matching and a native
+review window. The local Mac build includes opt-in Whisper downloads. 8K59.94 and 1080p960
+file/timing tests and a generated codec/container audit are reproducible.
+[Workflow, setup and remaining P1/P2 work](agent-workflow.md) · [Compatibility audit](format-compatibility.md).
+The upstream priorities and estimates below have not been recalibrated for this fork.
+
 
 ## Current focus
 

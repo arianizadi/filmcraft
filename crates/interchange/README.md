@@ -34,9 +34,12 @@ checks expected Unicode paths through the public converter, resolver and EDL imp
 Importers accept frame rates up to 1 000 000 per second (above video rates and PCM audio sample
 rates such as 192 000 Hz, which OTIO uses as a rate). An FCP7 `timebase` is clamped to it and an OTIO rate beyond it
 uses the default, each with a warning (DSD audio at 2.8 or 5.6 MHz is beyond it, so an OTIO DSD clip is retimed at
-the default rate and reported). An OTIO sequence takes its rate from the global start time or the first item at
-a rate a sequence can run at (at most 1000 fps): a gap or clip at a sample rate such as 48 000 keeps its exact time
-but does not set it (`tests/it/otio.rs`). Also, a sequence
+the default rate and reported). Saved OTIO `metadata.filmcraft.settings` explicitly sets the sequence
+rate. Otherwise a global start time supplies it unless that clock is identified only by audio tracks;
+then picture-clip video metadata or picture timing supplies the rate. Audio tracks never establish
+picture FPS, and picture clips take precedence over gaps. This preserves 960 fps and higher video
+rates alongside 48 000 Hz audio without using a numeric FPS cutoff. An ambiguous global audio clock
+produces a warning; exact clip, gap, and audio times remain unchanged (`tests/it/otio.rs`). Also, a sequence
 or media rate beyond it (an FCPXML `frameDuration` of `1/9223372036854775807s`) is reset to the
 default with a warning: such a rate overflowed the frame arithmetic of every export. Sequence and
 media start timecodes beyond 360 000 000 000 frames are reset the same way. Covered by

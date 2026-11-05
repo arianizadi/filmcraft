@@ -42,3 +42,22 @@ cargo test -p filmcraft-codecs --lib audio::panic_tests
 FILMCRAFT_REQUIRE_ORACLES=1 cargo test -p filmcraft-codecs
 cargo xtask ci
 ```
+
+## Standalone AC-3 / E-AC-3
+
+`.ac3`, `.eac3` and `.ec3` imports use the existing clean-room decoder implemented from ATSC
+A/52:2012 (see `crates/ac3/README.md`). The raw importer accepts one complete primary program
+with a constant codec, sample rate and channel layout. It rejects truncated syncframes,
+trailing junk, dependent substreams, additional programs and configuration changes explicitly;
+it does not silently shorten the file or drop channels. Native decoder limitations still apply
+(E-AC-3 adaptive hybrid transform and enhanced coupling are unsupported).
+
+Raw files decode into memory. Encoded input is capped at 128 MiB before whole-file reads on reader-backed imports, and
+decoded samples at 256 MiB across channels before allocation. Longer audio should be remuxed to
+MP4, Matroska or MPEG-TS for the existing packet-streaming paths. The reader opener preserves
+this bound when the file is imported by a native or browser host.
+
+`tests/it/raw_dolby.rs` generates short tones externally, compares actual AC-3/E-AC-3 samples,
+metadata and seek windows with the external oracle, and mutation-tests truncations, bit flips,
+bad frame sizes and unsupported substreams under `catch_unwind`. Raw import does not add any
+FFmpeg dependency to the product.

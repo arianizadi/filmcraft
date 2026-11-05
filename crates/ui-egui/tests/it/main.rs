@@ -1,3 +1,4 @@
+mod agent_review_ui;
 mod audio51_ui;
 mod audio_fx_editor_ui;
 mod caption_copy_paste_ui;

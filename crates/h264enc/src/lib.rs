@@ -158,6 +158,9 @@ pub struct EncoderConfig {
     pub slices: usize,
     /// Access unit delimiters in Annex-B output.
     pub aud: bool,
+    /// Include a diagnostic user-data SEI naming the encoder version and options. Defaults true.
+    /// Disabling this does not remove HDR metadata; all emitted bytes still count toward rate control.
+    pub encoder_note: bool,
     /// HDR static metadata sent in an SEI with the first access unit: the 24-byte SMPTE ST 2086
     /// mastering display payload (payloadType 137) …
     pub mastering_display: Option<[u8; 24]>,
@@ -191,6 +194,7 @@ impl EncoderConfig {
             mastering_display: None,
             content_light: None,
             aud: true,
+            encoder_note: true,
             level: None,
         }
     }
@@ -309,6 +313,21 @@ fn crf_level_kbps(crf: f32, mbw: usize, mbh: usize, fps: f64) -> u32 {
     (pixels * fps * bpp / 1000.0).ceil() as u32
 }
 
+/// Progressive H.264 has frame_rate = time_scale / (2 * num_units_in_tick). Reduce before
+/// doubling; if the reduced denominator is even, absorb that factor of two there instead.
+/// An irreducible numerator larger than half u32::MAX with an odd denominator cannot fit.
+fn vui_timing(num: u32, den: u32) -> Option<(u32, u32)> {
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let (num, den) = (num / a, den / a);
+    if den.is_multiple_of(2) { Some((den / 2, num)) } else { num.checked_mul(2).map(|scale| (den, scale)) }
+}
+
 impl Encoder {
     /// The settings that shaped the stream, x264-style (`key=value` separated by spaces), for the
     /// user_data_unregistered SEI: a file says how it was made (`strings`, `ffprobe -show_data`).
@@ -358,6 +377,12 @@ impl Encoder {
         if cfg.fps_num == 0 || cfg.fps_den == 0 {
             return Err(Error::InvalidFrameRate(cfg.fps_num, cfg.fps_den));
         }
+        let (num_units_in_tick, time_scale) = vui_timing(cfg.fps_num, cfg.fps_den).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "frame rate {}/{} cannot be represented exactly by H.264's unsigned 32-bit VUI timing fields",
+                cfg.fps_num, cfg.fps_den
+            ))
+        })?;
         if cfg.bframes > 3 {
             return Err(Error::InvalidConfig("bframes must be 0..=3".into()));
         }
@@ -446,7 +471,12 @@ impl Encoder {
         if matches!(cfg.rate, RateControl::Cbr { kbps: 0 } | RateControl::Vbr { target_kbps: 0, .. }) {
             return Err(Error::InvalidConfig("bitrate must be non-zero".into()));
         }
-        let auto = nal::pick_level(mbw as u32, mbh as u32, fps, max_refs as u32, kbps_for_level, high);
+        let auto = nal::checked_level(mbw as u32, mbh as u32, (cfg.fps_num, cfg.fps_den), max_refs as u32, kbps_for_level, high).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "{}x{} at {}/{} fps, reference frames and bitrate exceed every implemented H.264 level (maximum 6.2); reduce frame size, frame rate or bitrate",
+                cfg.width, cfg.height, cfg.fps_num, cfg.fps_den
+            ))
+        })?;
         let level = cfg.level.map_or(auto, |l| nal::level_at_least(l, auto));
         let (profile_idc, constraint) = match cfg.profile {
             Profile::Baseline => (66u8, 0xC0u8), // constraint_set0 + set1 => Constrained Baseline
@@ -471,8 +501,8 @@ impl Encoder {
                 colour_primaries: cfg.color.primaries,
                 transfer: cfg.color.transfer,
                 matrix: cfg.color.matrix,
-                num_units_in_tick: cfg.fps_den,
-                time_scale: cfg.fps_num.saturating_mul(2),
+                num_units_in_tick,
+                time_scale,
                 max_num_reorder_frames: reorder,
                 max_dec_frame_buffering: max_refs as u32,
             },
@@ -898,8 +928,10 @@ impl Encoder {
         }
         if !self.sei_sent {
             self.sei_sent = true;
-            let text = format!("filmcraft-h264enc {} - clean-room H.264 encoder - options: {}", env!("CARGO_PKG_VERSION"), self.options());
-            nals.push(nal::nal(0, NAL_SEI, &nal::sei_user_data_rbsp(&text)));
+            if self.cfg.encoder_note {
+                let text = format!("filmcraft-h264enc {} - clean-room H.264 encoder - options: {}", env!("CARGO_PKG_VERSION"), self.options());
+                nals.push(nal::nal(0, NAL_SEI, &nal::sei_user_data_rbsp(&text)));
+            }
             if self.cfg.mastering_display.is_some() || self.cfg.content_light.is_some() {
                 nals.push(nal::nal(0, NAL_SEI, &nal::sei_hdr_rbsp(self.cfg.mastering_display.as_ref(), self.cfg.content_light)));
             }
@@ -1005,4 +1037,45 @@ fn jobs_stride_y(mbw: usize) -> usize {
 
 fn jobs_stride_c(mbw: usize) -> usize {
     mbw * 8 + 2 * CHROMA_PAD
+}
+
+#[cfg(test)]
+mod frame_rate_tests {
+    use super::*;
+
+    #[test]
+    fn vui_timing_preserves_large_reducible_and_even_denominator_rates() {
+        for (num, den) in [(30000, 1001), (240, 1), (960, 1), (u32::MAX, u32::MAX), (u32::MAX, u32::MAX - 1), (3_000_000_001, 3_000_000_000)] {
+            let (units, scale) = vui_timing(num, den).unwrap();
+            assert_ne!(units, 0);
+            assert_ne!(scale, 0);
+            assert_eq!(u128::from(scale) * u128::from(den), 2 * u128::from(units) * u128::from(num));
+            let mut cfg = EncoderConfig::new(16, 16, num, den);
+            cfg.threads = 1;
+            cfg.rate = RateControl::Qp(23);
+            let encoder = Encoder::new(cfg).unwrap();
+            assert_eq!((encoder.sps.vui.num_units_in_tick, encoder.sps.vui.time_scale), (units, scale));
+        }
+        assert_eq!(vui_timing(u32::MAX, u32::MAX - 1), Some(((u32::MAX - 1) / 2, u32::MAX)));
+    }
+
+    #[test]
+    fn unrepresentable_vui_rational_is_rejected_instead_of_saturated() {
+        for (num, den) in [(u32::MAX, u32::MAX - 2), (3_000_000_001, 3_000_000_003), (0, 1), (1, 0)] {
+            assert!(vui_timing(num, den).is_none());
+            let mut cfg = EncoderConfig::new(16, 16, num, den);
+            cfg.threads = 1;
+            cfg.rate = RateControl::Qp(23);
+            let result = std::panic::catch_unwind(|| Encoder::new(cfg));
+            assert!(result.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn level_limits_are_exact_at_rational_macroblock_rate_boundaries() {
+        // Level 6.2 allows exactly 16,711,680 macroblocks per second. 16x16 needs one MB.
+        assert_eq!(nal::checked_level(1, 1, (16_711_680, 1), 1, None, true), Some(62));
+        assert_eq!(nal::checked_level(1, 1, (33_423_361, 2), 1, None, true), None);
+        assert_eq!(nal::checked_level(u32::MAX, u32::MAX, (u32::MAX, 1), u32::MAX, None, true), None);
+    }
 }

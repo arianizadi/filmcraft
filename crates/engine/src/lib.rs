@@ -11,17 +11,22 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod aaf_omf;
+pub mod agent_inspect;
+pub mod agent_plans;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
+pub mod command_access;
 pub mod commands;
 pub mod demo;
 pub mod doc_path;
 pub mod essential_sound;
 pub mod export_tools;
+pub mod grades;
 pub mod graphic_templates;
 pub mod graphics;
+pub mod inspection;
 pub mod interchange;
 pub mod keyboard;
 mod keyframe_move;
@@ -36,6 +41,7 @@ pub mod media_watch;
 pub mod mixer;
 pub mod multicam;
 pub mod narration;
+pub mod operations;
 mod palette;
 pub mod panels;
 pub mod paste_media;
@@ -445,6 +451,8 @@ pub struct Session {
     /// Runtime identity of the opened project, stable across edits/undo and renewed on replacement.
     pub project_instance: Arc<()>,
     pub history: History,
+    pub operations: operations::OperationStore,
+    pub agent_plans: agent_plans::PlanStore,
     pub revision: u64,
     /// Bumped whenever the session installs a different project document (`file.newProject`,
     /// open/import/recovery/template). Frontends use it to discard UI state (text edits, IME
@@ -571,6 +579,8 @@ impl Session {
             project: Arc::new(Project::new("Untitled")),
             project_instance: Arc::new(()),
             history: History { limit: 200, ..Default::default() },
+            operations: Default::default(),
+            agent_plans: Default::default(),
             revision: 1,
             document_epoch: 0,
             saved_revision: 1,
@@ -793,7 +803,18 @@ impl Session {
             && spec.journal
             && self.prefs.media_analysis.auto_transcribe
             && self.prefs.media_analysis.auto_transcribe_scope == "sequenceClips"
-            && !matches!(id, "edit.undo" | "edit.redo" | "file.newProject" | "file.openDemoProject" | "file.open" | "file.revert" | "file.recover"))
+            && !matches!(
+                id,
+                "agent.apply"
+                    | "agent.execute"
+                    | "edit.undo"
+                    | "edit.redo"
+                    | "file.newProject"
+                    | "file.openDemoProject"
+                    | "file.open"
+                    | "file.revert"
+                    | "file.recover"
+            ))
         .then(|| self.project.clone());
         let outermost = self.exec_depth == 0;
         if outermost {

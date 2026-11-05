@@ -70,6 +70,7 @@ impl FilmcraftApp {
         panels::dialogs::show(self, &ctx);
         panels::file_dialogs::show_overwrite(self, &ctx);
         updates_ui::show(self, &ctx);
+        crate::agent_review::show(self, &ctx);
         if !self.ui.show_status_bar {
             return;
         }

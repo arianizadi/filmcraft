@@ -739,6 +739,37 @@ pub fn render_clip(
     item_layer(project, seq, item, t, opts, sources, &tc).map(|(img, _, _)| img)
 }
 
+/// Render an isolated timeline clip over transparent black, including its opacity and masks,
+/// without transitions, captions or other tracks composited above/below it. The complete
+/// sequence remains available to effects that explicitly sample another track. Its working and
+/// display transforms match [`render_sequence`]. Track visibility does not hide an explicitly
+/// requested subject; a disabled clip itself remains blank.
+pub fn render_isolated_clip(
+    project: &Project,
+    seq_id: ItemId,
+    clip: filmcraft_project::ClipId,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+) -> Option<Image> {
+    let seq = project.sequence(seq_id)?;
+    let (_, item) = seq.find_item(clip)?;
+    if !item.range().contains(t) || is_adjustment(project, item) {
+        return None;
+    }
+    let (w, h) = output_size(seq, opts.scale);
+    let mut image = Image::new(w, h);
+    if item.enabled {
+        let tc = format_time(t, seq.settings.frame_rate, seq.settings.drop_frame, TimeDisplay::Timecode, seq.settings.sample_rate as i64);
+        let (layer, opacity, blend) = item_layer(project, seq, item, t, opts, sources, &tc)?;
+        blend::composite(&mut image, &layer, opacity, blend);
+    }
+    if !opts.working_output {
+        colorman::to_display(&mut image, &seq.settings.color);
+    }
+    Some(image)
+}
+
 /// Frame Blending / Optical Flow on a speed-changed clip, or on media whose frame rate differs from
 /// the sequence's (24 fps on 29.97 at 100 %): the later source frame to mix in and its weight
 /// (0..1) at timeline `t`, or None when the exact media time falls on a source frame (or the clip

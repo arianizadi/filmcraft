@@ -137,6 +137,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn personal_fork_never_checks_the_upstream_release_source() {
+        assert_eq!(crate::UPDATE_APP.repo, "arianizadi/filmcraft");
+        assert_eq!(crate::UPDATE_APP.developer, "Arian’s fork");
+        assert!(env!("CARGO_PKG_VERSION").contains("-arian."));
+    }
+
+    #[test]
     fn default_runtime_is_idle() {
         let rt = Runtime::default();
         assert!(!rt.manual_window_open);

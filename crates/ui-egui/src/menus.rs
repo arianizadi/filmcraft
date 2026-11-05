@@ -22,6 +22,7 @@ macro_rules! uic {
 }
 
 pub const UI_COMMANDS: &[UiCommand] = &[
+    uic!("window.agentReview", "Agent Review", ["Window"], None),
     uic!("window.dockAction", "Docking Action", [], None),
     uic!("window.dockPanel", "Dock Panel", [], None),
     uic!("window.floatPanel", "Undock Panel", [], None),
@@ -374,6 +375,10 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
         return r;
     }
     match id {
+        "window.agentReview" => {
+            app.agent_review.open = true;
+            return Ok(Value::Null);
+        }
         "playback.slowForward" | "playback.slowReverse" if targets_source(app, &params) => {
             app.shuttle_source(if id == "playback.slowForward" { 0.25 } else { -0.25 })?;
             return Ok(json!({"playing": app.source_playback.clock.playing, "speed": app.source_playback.clock.speed}));

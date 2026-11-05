@@ -28,11 +28,18 @@ for p in enc.flush() { /* ... */ }
 
 - Input: planar 4:2:0 8-bit (`YuvFrame` with strides); any even size, non-multiple-of-16 sizes are
   cropped via the SPS frame cropping. `try_encode` returns an error instead of panicking on short planes.
+- Frame rates retain exact rational VUI timing. Construction rejects timing that cannot fit H.264's
+  32-bit timing fields and configurations exceeding every implemented Annex A level, including
+  level 6.2. High-frame-rate support depends on frame size and bitrate; 1080p960 and 8K60 fit,
+  while 4K960 exceeds the macroblock-rate limit.
 - Output: one `Packet` per picture in decoding order with `pts` (as given), `dts` (reorder-delayed, always
   `<= pts` and strictly increasing), `keyframe` (IDR) and the frame type/QP. Annex-B packets carry an AUD,
   SPS/PPS on every IDR and an identification SEI on the first picture.
 - Two-pass: encode once with `cfg.pass = Pass::First`, take `enc.pass_stats()` (serialisable with
   `PassStats::to_text/from_text`), then encode again with `Pass::Second(stats)`.
+- `cfg.encoder_note = false` omits the optional version/options user-data SEI. HDR metadata remains
+  enabled independently. Metadata bytes are part of bitrate/VBV accounting, so deterministic
+  coding-decision fixtures disable this version-dependent note rather than excluding its bits.
 - `set_recon_capture(true)` + `take_recon()` expose the encoder's reconstructed pictures (used by the tests to
   prove encoder/decoder match).
 

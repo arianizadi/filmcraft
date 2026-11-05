@@ -139,6 +139,8 @@ fn apply_match_grades_the_clip_towards_the_reference() {
     // reference: the middle of the last clip on V1 (a different shot)
     let other = q.video_tracks[0].items.iter().rfind(|i| i.id != clip).unwrap();
     let reference = other.start + filmcraft_time::Tick(other.duration.0 / 2);
+    let original = s.project.to_json();
+    let history = s.history.undo.len();
     let r = s.execute("lumetri.applyMatch", json!({"referenceTime": reference.0, "faceDetection": true})).unwrap();
     let (before, after) = (r["distanceBefore"].as_f64().unwrap(), r["distanceAfter"].as_f64().unwrap());
     assert!(after < before * 0.8, "match improves the statistics distance: {r}");
@@ -148,11 +150,10 @@ fn apply_match_grades_the_clip_towards_the_reference() {
         .iter()
         .any(|w| e.param(w).and_then(|p| p.value.as_vec2()).is_some_and(|v| v.x.abs() + v.y.abs() > 1e-3));
     assert!(moved, "{r}");
-    // one undo step
+    // A newly added effect and its match are one undo step, so undo restores the whole clip.
+    assert_eq!(s.history.undo.len(), history + 1);
     s.execute("edit.undo", json!({})).unwrap();
-    let q = s.active_sequence().unwrap();
-    let e = q.find_item(clip).unwrap().1.effects.iter().find(|e| e.effect == "lumetri").unwrap();
-    assert_eq!(e.param("wheel_midtones").and_then(|p| p.value.as_vec2()).map(|v| v.x), Some(0.0));
+    assert_eq!(s.project.to_json(), original);
     // a reference inside the clip itself is refused
     let inside = s.playhead();
     assert!(s.execute("lumetri.applyMatch", json!({"referenceTime": inside.0})).is_err());

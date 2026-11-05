@@ -1,6 +1,8 @@
 //! The encoder's decisions are pinned: the coded slices of synthetic clips hash to fixed values,
 //! so a change that alters any decision (a mode, a motion vector, a quantiser), and not only one
-//! that breaks decoding, fails here. Only slice NAL units are hashed: the SEI names the version.
+//! that breaks decoding, fails here. Only slice NAL units are hashed. Disable the diagnostic SEI
+//! for these fixtures as well: its version-dependent byte length correctly counts toward ABR/VBV
+//! and would otherwise change later quantisers even though the SEI itself is not hashed.
 
 use crate::common::{annexb_nals, synth};
 use filmcraft_h264enc::*;
@@ -38,16 +40,20 @@ fn cfg(profile: Profile, preset: Preset, rate: RateControl) -> EncoderConfig {
     c.rate = rate;
     c.slices = 3;
     c.threads = 3;
+    c.encoder_note = false;
     c
 }
 
 #[test]
 fn coded_slices_are_pinned() {
+    // These ABR/VBR pins were established with encoder_note=false and independently matched
+    // under package versions 0.17.0 and 0.17.0-arian.1. Removing the diagnostic header changes
+    // its real bitrate overhead, so those two decision pins differ from the older note-on pins.
     let cases = [
         ("high balanced crf", cfg(Profile::High, Preset::Balanced, RateControl::Crf(23.0)), 0xecd1_35a9_3a46_f7d8u64),
-        ("high quality vbr", cfg(Profile::High, Preset::Quality, RateControl::Vbr { target_kbps: 800, max_kbps: 1200 }), 0x2129_41dd_a9c5_f087),
+        ("high quality vbr", cfg(Profile::High, Preset::Quality, RateControl::Vbr { target_kbps: 800, max_kbps: 1200 }), 0x8bd8_a978_1a89_413f),
         ("main speed qp", cfg(Profile::Main, Preset::Speed, RateControl::Qp(30)), 0xa123_355d_d580_4e7b),
-        ("baseline balanced cbr", cfg(Profile::Baseline, Preset::Balanced, RateControl::Cbr { kbps: 600 }), 0x21ce_6999_8c31_8b0a),
+        ("baseline balanced cbr", cfg(Profile::Baseline, Preset::Balanced, RateControl::Cbr { kbps: 600 }), 0x6455_fe62_0a26_0217),
     ];
     let got: Vec<u64> = cases.iter().map(|(_, c, _)| slices_hash(c.clone(), 20)).collect();
     for ((name, _, _), got) in cases.iter().zip(&got) {

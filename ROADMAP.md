@@ -1,5 +1,7 @@
 # FilmCraft Roadmap
 
+- Personal fork, 2026-11-04: shipped the reviewed agent-edit foundation (immutable plans, exact snapshot previews/scopes, typed grades, operation receipts, one-step approval), native 8K/custom-rate validation and a speech-enabled Mac build. See [the workflow and remaining milestones](docs/agent-workflow.md) and [format verification](docs/format-compatibility.md). The parity estimates below remain the upstream baseline.
+
 - M3: Markers and clips share the existing sixteen clip presets plus a project-local custom hex palette. A reusable wheel/hex editor defines colors separately from marker editing; timeline markers expose Edit Marker with Name, Author and Notes. Marker/clip colors, palette edits and authors persist with undo and project saves. AVB marker import remains separate.
 
 - UI.6: Compact Source and Program monitors separate timecodes from view settings and retain Source drag choices. Transport controls use the shared toolbar sizing helper, with overflow actions in an operable More menu and a scrolling fallback at tiny widths.

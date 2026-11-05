@@ -234,12 +234,25 @@ pub(crate) fn f64_p(p: &Value, k: &str) -> Option<f64> {
 }
 /// `fps` as a sequence frame rate; zero or negative rates are refused (all frame maths divides by them).
 fn fps_p(p: &Value, cmd: &str) -> Result<Option<FrameRate>> {
-    let Some(fps) = f64_p(p, "fps") else { return Ok(None) };
-    let r = FrameRate::from_f64(fps);
-    if r.num <= 0 || r.frame_duration() <= Tick::ZERO {
-        return Err(bad(cmd, format!("fps must be a positive frame rate, got {fps}")));
-    }
-    Ok(Some(r))
+    let value = match (p.get("fps"), p.get("frameRate")) {
+        (Some(_), Some(_)) => return Err(bad(cmd, "provide fps or frameRate, not both")),
+        (None, None) => return Ok(None),
+        (Some(v), None) | (None, Some(v)) => v,
+    };
+    let rate = if value.is_object() {
+        let num = value.get("num").and_then(Value::as_i64).ok_or_else(|| bad(cmd, "frameRate.num must be an integer"))?;
+        let den = value.get("den").and_then(Value::as_i64).ok_or_else(|| bad(cmd, "frameRate.den must be an integer"))?;
+        if num <= 0 || den <= 0 || num > i64::from(u32::MAX) || den > i64::from(u32::MAX) {
+            return Err(bad(cmd, "frameRate components must be positive unsigned 32-bit integers"));
+        }
+        FrameRate::new(num, den)
+    } else {
+        let fps = value.as_f64().filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| bad(cmd, "fps must be a finite positive number"))?;
+        FrameRate::from_f64(fps)
+    };
+    let settings = filmcraft_project::SequenceSettings { frame_rate: rate, ..Default::default() };
+    settings.validate().map_err(|e| bad(cmd, e))?;
+    Ok(Some(rate))
 }
 pub(crate) fn bool_p(p: &Value, k: &str) -> Option<bool> {
     p.get(k).and_then(Value::as_bool)
@@ -1512,7 +1525,7 @@ fn build() -> Vec<CommandSpec> {
             "Sequence…",
             ["File", "New"],
             Some("Cmd+N"),
-            r#"{"name":str,"width":u32=1920,"height":u32=1080,"fps":f64=23.976,"sampleRate":u32=48000,"video":n=3,"audio":n=3,"mix":"Stereo|Mono|5.1|Adaptive"?,"trackType":"Standard|Mono|5.1|Adaptive"?,"fromItem":itemId?,"fromItems":[itemId]?}"#,
+            r#"{"name":str,"width":u32=1920,"height":u32=1080,"fps":f64=23.976|{"num":i64,"den":i64},"frameRate":{"num":i64,"den":i64}?,"sampleRate":u32=48000,"video":n=3,"audio":n=3,"mix":"Stereo|Mono|5.1|Adaptive"?,"trackType":"Standard|Mono|5.1|Adaptive"?,"fromItem":itemId?,"fromItems":[itemId]?}"#,
             always,
             |s, p| s.edit_group("New Sequence", |s| {
                 // `fromItems` is `fromItem` for a list: the first sets the sequence, the rest follow it back to back
@@ -2684,7 +2697,7 @@ fn build() -> Vec<CommandSpec> {
             "Sequence Settings…",
             ["Sequence"],
             None,
-            r#"{"width":u32?,"height":u32?,"fps":f64?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?,"dropFrame":bool?,"maxRenderQuality":bool?,"workingSpace":"rec709"|"rec2100-pq"|"rec2100-hlg"?,"wideGamut":bool?,"autoToneMap":bool?,"scaleMotion":bool=false}"#,
+            r#"{"width":u32?,"height":u32?,"fps":f64|{"num":i64,"den":i64}?,"frameRate":{"num":i64,"den":i64}?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?,"dropFrame":bool?,"maxRenderQuality":bool?,"workingSpace":"rec709"|"rec2100-pq"|"rec2100-hlg"?,"wideGamut":bool?,"autoToneMap":bool?,"scaleMotion":bool=false}"#,
             has_seq,
             |s, p| {
                 const CMD: &str = "sequence.settings";
@@ -4007,7 +4020,7 @@ fn build() -> Vec<CommandSpec> {
                     .iter()
                     .map(|c| {
                         let all: Vec<&str> = s.shortcuts.for_command(c.id).iter().map(|b| b.keys.as_str()).collect();
-                        json!({"id": c.id, "label": c.label, "menu": c.menu, "shortcut": s.shortcuts.primary(c.id), "shortcuts": all, "defaultShortcut": c.shortcut, "params": c.params, "enabled": (c.enabled)(s).is_ok()})
+                        json!({"id": c.id, "label": c.label, "menu": c.menu, "shortcut": s.shortcuts.primary(c.id), "shortcuts": all, "defaultShortcut": c.shortcut, "params": c.params, "category": c.id.split('.').next(), "enabled": (c.enabled)(s).is_ok(), "disabledReason": (c.enabled)(s).err(), "units": {"time":"ticks (254016000000/s)", "frame":"zero-based frame index"}})
                     })
                     .collect(),
             ))
@@ -4030,12 +4043,16 @@ fn build() -> Vec<CommandSpec> {
         )),
     ];
     crate::sequence_tools::splice(&mut v);
+    v.extend(crate::agent_plans::commands());
+    v.extend(crate::agent_inspect::commands());
+    v.extend(crate::operations::commands());
     v.extend(crate::captions::commands());
     v.extend(crate::settings::commands());
     v.extend(crate::mixer::commands());
     v.extend(crate::multicam::commands());
     v.extend(crate::essential_sound::commands());
     v.extend(crate::color::commands());
+    v.extend(crate::grades::commands());
     v.extend(crate::graphics::commands());
     v.extend(crate::graphic_templates::commands());
     v.extend(crate::shortcuts::commands());
@@ -4048,6 +4065,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::transcript::commands());
     v.extend(crate::panels::commands());
     v.extend(crate::scopes::commands());
+    v.extend(crate::inspection::commands());
     v.extend(crate::remix::commands());
     v.extend(crate::voiceover::commands());
     v.extend(crate::narration::commands());
