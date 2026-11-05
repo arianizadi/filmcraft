@@ -51,12 +51,14 @@ Full `cargo xtask ci` passed with 4,774 successful test executions, formatting, 
 
 ## Validation for the expanded workflow
 
-`RUST_TEST_THREADS=4 cargo xtask ci` passed: 4,944 successful test executions, formatting,
+`RUST_TEST_THREADS=4 cargo xtask ci` passed: 4,946 successful test executions, formatting,
 all-target workspace Clippy, dependency layers, all 61 asset attributions and WASM checking for
 50 crates. Four test workers bound simultaneous native UI/background workers on the development
 Mac; no test cases were removed. Independent focused reviews found and fixed source overwrite,
 folder/receipt access, delivery snapshot, caption verification, retry, stable identity and job
 recovery problems before publication. Added dependencies were checked for permitted licenses.
+Explicit screenshot outputs also create files exclusively and refuse existing files, hardlinks
+and symlinks; inline screenshots remain available without writing a file.
 
 Actual local footage validation covered 7680×4320 HEVC Main 10 HLG at 60000/1001, native stills,
 a two-frame full-resolution Main 10 export and native/ffmpeg reopening, with unchanged full source

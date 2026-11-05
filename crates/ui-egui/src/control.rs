@@ -743,6 +743,7 @@ fn crop_pixels(size: [usize; 2], crop: Option<[f32; 4]>, ppp: f32) -> Result<(us
 
 /// Save a screenshot whose scale was captured with the request. Hidden logic ticks must not read
 /// `Context::pixels_per_point()` for an image produced from a different UI pass.
+/// Explicit output paths create a new file exclusively; existing files and symlinks are refused.
 pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, crop: Option<[f32; 4]>, ppp: f32) -> Value {
     let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
     let (x0, y0, cw, ch) = match crop_pixels(image.size, crop, ppp) {
@@ -769,10 +770,22 @@ pub fn save_screenshot_with_ppp(image: &egui::ColorImage, path: Option<&str>, cr
     }
     let path = path.map(str::to_string).unwrap_or_else(|| filmcraft_engine::temp_dir().join("filmcraft-screenshot.png").to_string_lossy().to_string());
     match encode_png(&rgba, cw as u32, ch as u32) {
-        Ok(png) => match std::fs::write(&path, png) {
-            Ok(()) => json!({"ok": true, "result": {"path": path, "width": cw, "height": ch}}),
-            Err(e) => json!({"ok": false, "error": e.to_string()}),
-        },
+        Ok(png) => {
+            use std::io::Write;
+            // Retain the exclusively opened handle while writing; an existence check followed
+            // by std::fs::write would allow a collision or symlink to overwrite precious media.
+            let saved = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).and_then(|mut file| {
+                file.write_all(&png)?;
+                file.sync_all()
+            });
+            match saved {
+                Ok(()) => json!({"ok": true, "result": {"path": path, "width": cw, "height": ch}}),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    json!({"ok":false,"error":format!("Screenshot output already exists: {path}. Choose a new path or omit path for an inline PNG.")})
+                }
+                Err(e) => json!({"ok":false,"error":format!("Could not save screenshot to {path}: {e}")}),
+            }
+        }
         Err(e) => json!({"ok": false, "error": e}),
     }
 }
@@ -786,6 +799,54 @@ mod inline_screenshot_tests {
         assert_eq!(result["ok"], true);
         assert!(result["result"]["pngBase64"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(result["result"].get("path").is_none());
+    }
+
+    #[test]
+    fn explicit_screenshot_path_creates_png_and_refuses_to_overwrite_precious_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = egui::ColorImage::filled([2, 2], egui::Color32::from_rgb(12, 34, 56));
+        let output = dir.path().join("new-shot.png");
+        let result = super::save_screenshot_with_ppp(&image, output.to_str(), None, 1.0);
+        assert_eq!(result["ok"], true, "{result}");
+        let png = std::fs::read(&output).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [12, 34, 56, 255]);
+        for name in ["original.mp4", "project.fcproj", "existing.png"] {
+            let precious = dir.path().join(name);
+            let bytes = format!("precious original bytes for {name}").into_bytes();
+            std::fs::write(&precious, &bytes).unwrap();
+            let rejected = super::save_screenshot_with_ppp(&image, precious.to_str(), None, 1.0);
+            assert_eq!(rejected["ok"], false, "{rejected}");
+            assert!(rejected["error"].as_str().unwrap().contains("Choose a new path"), "{rejected}");
+            assert_eq!(std::fs::read(&precious).unwrap(), bytes);
+        }
+        let rejected = super::save_screenshot_with_ppp(&image, output.to_str(), None, 1.0);
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(std::fs::read(&output).unwrap(), png);
+        let hardlink = dir.path().join("linked-shot.png");
+        std::fs::hard_link(&output, &hardlink).unwrap();
+        assert_eq!(super::save_screenshot_with_ppp(&image, hardlink.to_str(), None, 1.0)["ok"], false);
+        assert_eq!(std::fs::read(&output).unwrap(), png);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_screenshot_path_refuses_existing_and_dangling_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = egui::ColorImage::filled([2, 2], egui::Color32::BLACK);
+        let precious = dir.path().join("original.mp4");
+        let missing = dir.path().join("must-not-be-created.fcproj");
+        std::fs::write(&precious, b"precious original footage").unwrap();
+        for (name, target) in [("existing.png", &precious), ("dangling.png", &missing)] {
+            let link = dir.path().join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let rejected = super::save_screenshot_with_ppp(&image, link.to_str(), None, 1.0);
+            assert_eq!(rejected["ok"], false, "{rejected}");
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        }
+        assert_eq!(std::fs::read(precious).unwrap(), b"precious original footage");
+        assert!(!missing.exists());
     }
 }
 
