@@ -41,8 +41,8 @@ def private_open(path: Path, flags: int) -> int:
     return descriptor
 
 
-def token_for(directory: Path, create: bool = False) -> str:
-    path = directory / "control-token"
+def token_for(directory: Path, create: bool = False, filename: str = "control-token") -> str:
+    path = directory / filename
     if create:
         try:
             descriptor = private_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
@@ -123,6 +123,24 @@ def server_session(port: int, token: str, timeout: float = 2.0) -> dict:
     return result
 
 
+def server_command(port: int, token: str, command: str, params: dict) -> dict:
+    request = {"id": 1, "token": token, "method": "engine.execute", "params": {"command": command, "params": params}}
+    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as connection:
+        connection.settimeout(5.0)
+        connection.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        with connection.makefile("rb") as stream:
+            line = stream.readline(65_537)
+    if not line.endswith(b"\n") or len(line) > 65_536:
+        raise WorkflowError("Control server returned an invalid or oversized reply")
+    try:
+        response = json.loads(line)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise WorkflowError("Invalid pairing response") from error
+    if not isinstance(response, dict) or response.get("id") != 1 or not response.get("ok"):
+        raise WorkflowError("Pairing request was rejected; check the project path and requested folders in FilmCraft")
+    return response.get("result", {})
+
+
 def write_connection(directory: Path, data: dict) -> None:
     # An owner-only directory and exclusive temporary file prevent partial or symlink writes.
     temporary = directory / f"connection-{os.getpid()}-{secrets.token_hex(8)}.tmp"
@@ -195,7 +213,12 @@ def start(args: argparse.Namespace, directory: Path, app: Path, cli: Path) -> No
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("start", "mcp", "config", "status"), nargs="?", default="start")
+    parser.add_argument("mode", choices=("start", "mcp", "config", "status", "pair"), nargs="?", default="start")
+    parser.add_argument("--client", help="individual client id using letters, digits, - and _")
+    parser.add_argument("--label", help="display name for a pairing request")
+    parser.add_argument("--permission", choices=("inspect", "propose", "edit"), default="propose")
+    parser.add_argument("--media-folder", action="append", default=[])
+    parser.add_argument("--output-folder", action="append", default=[])
     parser.add_argument("--app", help="absolute FilmCraft.app or desktop executable path")
     parser.add_argument("--cli", help="absolute filmcraft-cli executable path")
     parser.add_argument("--port", type=int, default=9876)
@@ -206,9 +229,13 @@ def main() -> int:
     if not 1 <= args.port <= 65535 or not 1.0 <= args.startup_timeout <= 60.0:
         parser.error("--port must be 1..65535 and --startup-timeout must be 1..60 seconds")
     try:
+        if args.client and (len(args.client) > 128 or not all(c.isascii() and (c.isalnum() or c in "-_") for c in args.client)):
+            raise WorkflowError("--client must contain 1..128 ASCII letters, digits, - or _")
         if args.mode == "config":
             app, cli = binaries(args)
             arguments = [str(Path(__file__).resolve()), "mcp", "--app", str(app), "--cli", str(cli), "--port", str(args.port), "--support-dir", str(args.support_dir.expanduser().absolute())]
+            if args.client:
+                arguments += ["--client", args.client]
             print(json.dumps({"mcpServers": {"filmcraft": {"command": str(Path(sys.executable).resolve()), "args": arguments}}}, indent=2))
             return 0
         directory = support_directory(args.support_dir)
@@ -216,8 +243,25 @@ def main() -> int:
             app, cli = binaries(args)
             start(args, directory, app, cli)
             return 0
-        token = token_for(directory)
-        session = paired_session(directory, args.port, token)
+        owner_token = token_for(directory)
+        session = paired_session(directory, args.port, owner_token)
+        if args.mode == "pair":
+            if not args.client or not args.project:
+                raise WorkflowError("pair requires --client and --project (a saved project)")
+            credential = token_for(directory, create=True, filename=f"client-{args.client}-token")
+            project = Path(args.project).expanduser().resolve(strict=True)
+            grant = {"projectPath": str(project), "permission": args.permission,
+                     "mediaFolders": [str(Path(p).expanduser().resolve(strict=True)) for p in args.media_folder],
+                     "outputFolders": [str(Path(p).expanduser().resolve(strict=True)) for p in args.output_folder]}
+            result = server_command(args.port, owner_token, "agent.pairRequest", {
+                "clientId": args.client, "label": args.label or args.client, "credential": credential, "grant": grant})
+            print(json.dumps(result, indent=2))
+            print("Review this connection in Agent Review > Connections and folders, then use config --client " + args.client)
+            return 0
+        token = token_for(directory, filename=f"client-{args.client}-token") if args.client else owner_token
+        if args.client:
+            session = server_session(args.port, token)
+
         if args.mode == "status":
             print(json.dumps(session, indent=2))
             return 0

@@ -170,7 +170,33 @@ pub(super) fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, se
     }
     // markers: 8 × 12 pt pentagons in the marker colour, on the top row
     draw_markers(app, ui, &clip, layout, seq);
+    draw_review_annotations(app, ui, &clip, layout, t, seq_id);
     app.auto.add("timeline.ruler", ruler, "time ruler");
+}
+
+fn draw_review_annotations(app: &mut FilmcraftApp, ui: &mut egui::Ui, clip: &egui::Painter, layout: &Layout, t: &Tokens, seq_id: ItemId) {
+    let ruler = layout.ruler;
+    // Saved review notes share exact timeline ticks with the edit, independent of marker data.
+    let mut review_seek = None;
+    for note in app.session.project.review.annotations.iter().filter(|note| note.sequence == seq_id && note.status == "open") {
+        let x = layout.x_of(note.start);
+        let end = layout.x_of(note.end).max(x + 9.0);
+        let r = Rect::from_min_max(pos2(x, ruler.min.y + 14.0), pos2(end, ruler.min.y + 21.0)).intersect(ruler);
+        if r.width() <= 0.0 {
+            continue;
+        }
+        clip.rect_filled(r, 1.0, t.timecode);
+        let response =
+            ui.interact(r, egui::Id::unique(("timeline-review-note", note.id)), Sense::click()).on_hover_text(format!("{}: {}", note.kind, note.text));
+        app.auto.add_response(&format!("timeline.annotation.{}", note.id), &response, &note.text);
+        if response.clicked() {
+            review_seek = Some(note.start);
+        }
+    }
+    if let Some(at) = review_seek {
+        app.session.set_playhead(at);
+        app.agent_review.open = true;
+    }
 }
 
 /// The ruler's marker row: one pentagon per marker in its colour, its range band behind it and,

@@ -210,6 +210,17 @@ pub(crate) fn hdr_output(working_hdr: bool, sdr: bool, format: Format, hdr_avail
         }
 }
 
+/// The encoded video signal selected from the working space, SDR request and actual encoder
+/// capability. Preflight callers use the same decision as the exporter, including MXF's video
+/// codec and HEVC's native Main 10 probe. This does not open or write output files.
+pub fn output_color_signal(working: filmcraft_color::WorkingSpace, settings: &ExportSettings) -> ColorSignal {
+    match (hdr_output(working.is_hdr(), settings.sdr, settings.video_format(), crate::hdr_available), working) {
+        (true, filmcraft_color::WorkingSpace::Rec2100Pq) => ColorSignal::PQ,
+        (true, _) => ColorSignal::HLG,
+        _ => ColorSignal::default(),
+    }
+}
+
 fn make_venc(settings: &ExportSettings, w: u32, h: u32, rate: FrameRate) -> Result<Box<dyn VideoEncoder>> {
     pick_encoder(&video_factories().read().unwrap_or_else(|e| e.into_inner()).clone(), settings.video_format(), w, h, rate, settings)
 }
@@ -250,13 +261,10 @@ impl Exporter {
         // HDR sequences export HDR (H.264 / ProRes / DNxHR / APV, and H.265 where a registered encoder
         // writes Main 10) unless SDR is asked for; elsewhere H.265 is tone-mapped 8-bit SDR
         let pipe = q.settings.color;
-        let hdr_out = hdr_output(pipe.working.is_hdr(), settings.sdr, settings.video_format(), crate::hdr_available);
+        let signal = output_color_signal(pipe.working, settings);
+        let hdr_out = signal.is_hdr();
         let mut settings = settings.clone();
-        settings.signal = match (hdr_out, pipe.working) {
-            (true, filmcraft_color::WorkingSpace::Rec2100Pq) => ColorSignal::PQ,
-            (true, _) => ColorSignal::HLG,
-            _ => ColorSignal::default(),
-        };
+        settings.signal = signal;
         // bake the derived bitrate / keyframe values in for the encoder factories
         let r = settings.resolve(q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate);
         settings.bitrate_kbps = r.target_kbps;

@@ -26,7 +26,7 @@ Design principles:
  L5  ui-egui · automation · platform
  L4  engine
  L3  render · gpu · export · golden (test-only)
- L2  edit · codecs · interchange · captions · speech · tts · tts-text
+ L2  edit · codecs · interchange · captions · speech · vision · tts · tts-text
  L1  frame · media · project · audio-dsp · text
  L0  foundation: time · geom · color · bitstream · testkit (dev-dependency only)
      codecs/containers: isobmff · matroska · mxf · cfb · mpegts · ogg · h264 · h264enc · hevc · vp9 · av1 · mpeg2v · prores · dnx · apv · dng · aac · ac3 · mpa · opus
@@ -784,3 +784,5 @@ native menus) in `apps/filmcraft`. [roadmap.md](roadmap.md) has the milestone st
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-10 | trivial | Status line and revision history added; milestone link points at docs/roadmap.md |
+
+The `vision` crate (L2) provides local CLIP inference, pinned model verification and preprocessing; the engine connects it to library search.

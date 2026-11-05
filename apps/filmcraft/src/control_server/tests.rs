@@ -371,3 +371,33 @@ fn authenticated_tcp_request_reaches_the_ui_queue() {
     server.join().unwrap();
     assert_eq!(serde_json::from_str::<Value>(&reply).unwrap(), json!({"id": 7, "ok": true}));
 }
+
+#[test]
+fn individual_tokens_require_approval_and_cannot_spoof_identity_in_params() {
+    use filmcraft_engine::{Session, operations::Permission, pairing::Grant};
+    let dir =
+        std::env::temp_dir().join(format!("filmcraft-client-auth-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("test.fcproj");
+    std::fs::write(&project, b"test").unwrap();
+    let mut session = Session::default();
+    let grant = Grant {
+        project_path: project.to_string_lossy().into_owned(),
+        permission: Permission::Propose,
+        media_folders: vec![dir.to_string_lossy().into_owned()],
+        output_folders: vec![dir.to_string_lossy().into_owned()],
+    };
+    let credential = "e".repeat(64);
+    session.execute("agent.pairRequest", json!({"clientId":"test","label":"Test agent","credential":credential,"grant":grant})).unwrap();
+    let message =
+        serde_json::to_vec(&json!({"id":1,"token":credential,"method":"engine.execute","params":{"command":"agent.session","__clientId":"owner"}})).unwrap();
+    assert!(matches!(parse_line_paired(&message, TOKEN, &session.pairings), Line::Reject(_)));
+    session.pairings.approve("test", grant).unwrap();
+    assert!(matches!(parse_line_paired(&message,TOKEN,&session.pairings),Line::Request{client:Some(id),..} if id=="test"));
+    let message = serde_json::to_vec(&json!({"id":1,"token":TOKEN,"method":"engine.execute","params":{"client":"test"}})).unwrap();
+    assert!(matches!(parse_line_paired(&message, TOKEN, &session.pairings), Line::Request { client: None, .. }));
+    session.pairings.revoke("test").unwrap();
+    let message = serde_json::to_vec(&json!({"id":1,"token":credential,"method":"engine.execute"})).unwrap();
+    assert!(matches!(parse_line_paired(&message, TOKEN, &session.pairings), Line::Reject(_)));
+    std::fs::remove_dir_all(dir).unwrap();
+}

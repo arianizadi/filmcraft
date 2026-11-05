@@ -653,9 +653,10 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
     let src = s.source(it.item).ok_or_else(|| EngineError::Other("the clip has no media to track".into()))?;
     let size = filmcraft_render::source_size(&s.project, it.item).ok_or_else(|| bad("masks.track", "the clip has no picture"))?;
     let scale = (TRACK_MAX_WIDTH / size.0.max(1) as f64).min(1.0) as f32;
-    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+
     let label = format!("Track {} ({})", mask.name, if backward { "backward" } else { "forward" });
-    let job = crate::Job { id, label: label.clone(), progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, label.clone())?;
+    let id = job.id;
     job.progress.total.store(steps as u64, std::sync::atomic::Ordering::Relaxed);
     let keys: Arc<Mutex<Vec<(Tick, MaskPath)>>> = Arc::default();
     let (prog, res, out) = (job.progress.clone(), job.result.clone(), keys.clone());
@@ -722,7 +723,7 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
         prog.finished.store(true, Ordering::Relaxed);
         *lock(&res) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     s.mask_jobs.push(PendingTrack { job: id, target: MaskSel { clip, effect: ei, mask: mi }, seq: seq_id, keys, applied: 0, epoch: s.document_epoch });
     let wait = crate::commands::bool_p(p, "wait").unwrap_or(false);
@@ -730,7 +731,7 @@ fn track(s: &mut Session, p: &Value) -> Result<Value> {
         run();
         poll(s);
     } else {
-        std::thread::Builder::new().name("filmcraft-mask-track".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-mask-track", run)?;
     }
     let st = s.jobs.iter().find(|j| j.id == id).map(crate::Job::to_json).unwrap_or(Value::Null);
     Ok(json!({"job": id, "frames": steps, "status": st}))

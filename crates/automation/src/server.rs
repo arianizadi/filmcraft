@@ -16,8 +16,9 @@ use crate::{AutomationError, BridgeClient, png_rgba};
 
 mod workflow;
 use workflow::{
-    ApplyParams, DescribeParams, Effects, FramesParams, GetOperationParams, GradeAddress, GradeCopyParams, GradeGetParams, GradePatchParams, GradeResetParams,
-    InspectParams, MatchMode, MatchParams, OperationParams, PlanIdParams, PlanParams, RenderTarget, ScopesParams,
+    ApplyParams, DeliverEditParams, DescribeParams, Effects, FootageAnalysisParams, FramesParams, GetOperationParams, GradeAddress, GradeCopyParams,
+    GradeGetParams, GradePatchParams, GradeResetParams, InspectParams, MatchMode, MatchParams, MediaSearchParams, OperationParams, PlanIdParams, PlanParams,
+    PreparationStatusParams, PrepareFootageParams, RenderTarget, ScopesParams,
 };
 
 pub enum Backend {
@@ -591,6 +592,87 @@ impl FilmcraftMcp {
     }
 
     #[tool(
+        title = "Prepare footage for automatic review",
+        description = "Start bounded background preparation of original paths or imported sources with Propose/Edit permission. Returns a durable job; poll prepare_status/jobs.get until the resulting plan is ready, then preview exact frames and approve. Source files stay unchanged; no automatic downloads. Preparation always leaves apply false.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn prepare_footage(&self, Parameters(p): Parameters<PrepareFootageParams>) -> Result<CallToolResult, McpError> {
+        if p.apply == Some(true) {
+            return Ok(fail("prepare_footage never applies edits; preview and approve the resulting plan"));
+        }
+        let params = match workflow::engine_params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("workflow.prepareAsync", params).await)
+    }
+
+    #[tool(
+        title = "Inspect footage preparation status",
+        description = "Poll a durable preparation job. Successful preparation returns an adopted plan for preview/render and explicit approval; stale or cancelled preparation never applies edits.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn prepare_status(&self, Parameters(p): Parameters<PreparationStatusParams>) -> Result<CallToolResult, McpError> {
+        let params = match workflow::engine_params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("workflow.status", params).await)
+    }
+
+    #[tool(
+        title = "Deliver an approved edit",
+        description = "Export an explicitly approved plan at the inspected base_revision with Edit permission and caller-owned safe-retry operation identity. Default wait false returns a durable export job and the exact follow-up QC request. Reuse session_id, operation_id and idempotency_key after a lost response; get_operation reports ambiguous commits.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn deliver_edit(&self, Parameters(p): Parameters<DeliverEditParams>) -> Result<CallToolResult, McpError> {
+        let mut params = json!({"plan":p.plan,"path":p.path,"wait":p.wait.unwrap_or(false)});
+        if let Some(profile) = p.profile {
+            params["profile"] = json!(profile);
+        }
+        wrap(
+            self.operation(OperationParams {
+                session_id: p.session_id,
+                operation_id: p.operation_id,
+                idempotency_key: p.idempotency_key,
+                id: "workflow.deliver".into(),
+                params: Some(params),
+                base_revision: Some(p.base_revision),
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        title = "Search indexed local footage",
+        description = "Rank indexed source ranges with transcript evidence and optional thumbnails. A loaded compatible local CLIP model adds real semantic similarity; without it lexical/descriptive search remains available and semantic coverage is explicit. Index footage first with library.indexAsync. No uploads or automatic model downloads.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn media_search(&self, Parameters(p): Parameters<MediaSearchParams>) -> Result<CallToolResult, McpError> {
+        let params = match workflow::engine_params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        Ok(match self.run("library.search", params).await {
+            Ok(v) => frame_contents(v),
+            Err(e) => fail(e),
+        })
+    }
+
+    #[tool(
+        title = "Analyze source or timeline footage",
+        description = "Read bounded shot/black/static-frame, motion/sharpness, speech/silence, click, beat/onset and waveform measurements from source, isolated clip, sequence or staged snapshot. Positions are exact ticks and frames. Sparse samples state uncertainty; numeric descriptors do not claim object recognition. Speech uses only an installed local model.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn footage_analysis(&self, Parameters(p): Parameters<FootageAnalysisParams>) -> Result<CallToolResult, McpError> {
+        let params = match workflow::engine_params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("analysis.footage", params).await)
+    }
+
+    #[tool(
         title = "Describe one command",
         description = "Get one command's category, enablement/disabled reason, units, staging eligibility and its typed MCP parameter schema when available. Legacy commands retain their parameter documentation.",
         annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -603,6 +685,11 @@ impl FilmcraftMcp {
         let Some(mut command) = catalog.as_array().and_then(|a| a.iter().find(|v| v["id"] == p.id)).cloned() else { return Ok(fail("unknown command")) };
         command["eligibleForPlan"] = json!(filmcraft_engine::agent_plans::eligible_command(&p.id));
         let tool = match p.id.as_str() {
+            "workflow.prepareAsync" => Some("prepare_footage"),
+            "workflow.status" => Some("prepare_status"),
+            "workflow.deliver" => Some("deliver_edit"),
+            "library.search" => Some("media_search"),
+            "analysis.footage" => Some("footage_analysis"),
             "agent.plan" => Some("plan_edit"),
             "agent.apply" => Some("apply_plan"),
             "agent.preview" => Some("preview_plan"),
@@ -622,8 +709,29 @@ impl FilmcraftMcp {
             command["schemaTool"] = json!(tool);
             command["inputSchema"] = Value::Object((*def.input_schema).clone());
             command["schemaStatus"] = json!("typed_mcp_tool");
+            command["schemaParameterConvention"] =
+                json!("snake_case MCP arguments; mapped to engine parameters; nested profile overrides retain engine field names");
+            let example = match p.id.as_str() {
+                "workflow.prepareAsync" => Some(json!({"items":[12,13],"mode":"talkingHead","analyze":true,"transcribe":true,"apply":false})),
+                "workflow.deliver" => Some(
+                    json!({"plan":7,"base_revision":42,"path":"/absolute/output/edit.mp4","wait":false,"session_id":"from agent_session","operation_id":"delivery-7","idempotency_key":"delivery-7"}),
+                ),
+                "workflow.status" => Some(json!({"job":19})),
+                "library.search" => Some(json!({"query":"a laptop on a desk with red cups","limit":5,"thumbnails":true})),
+                "analysis.footage" => Some(json!({"subject":{"target":"source","item":12,"effects":"pre"},"max_frames":60,"speech":false})),
+                _ => None,
+            };
+            if let Some(example) = example {
+                command["examples"] = json!([example]);
+            }
         } else {
             command["schemaStatus"] = json!("legacy_parameter_documentation");
+            if p.id == "workflow.prepare" {
+                command["advancedSynchronousCommand"] = json!(true);
+                command["recommendedTool"] = json!("prepare_footage");
+                command["schemaNote"] =
+                    json!("The focused tool starts workflow.prepareAsync; this synchronous command retains engine parameter documentation.");
+            }
         }
         Ok(ok_json(&command))
     }

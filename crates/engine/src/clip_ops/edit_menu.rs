@@ -227,13 +227,20 @@ pub(super) fn paste_attributes(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut e = e.clone();
                 retime_effect(&mut e, src, &before, scale);
                 match dst.effects.iter_mut().find(|x| x.effect == *id) {
-                    Some(slot) => *slot = e,
-                    None => dst.effects.push(e),
+                    Some(slot) => {
+                        e.instance_id = slot.instance_id;
+                        *slot = e;
+                    }
+                    None => {
+                        e.instance_id = 0;
+                        dst.effects.push(e);
+                    }
                 }
             }
             for e in src.effects.iter().filter(|e| is_attribute_effect(e) && wants_effect(&sel, e)) {
                 let mut e = e.clone();
                 retime_effect(&mut e, src, &before, scale);
+                e.instance_id = 0;
                 dst.effects.push(e);
             }
             if *dst != before {
@@ -263,6 +270,7 @@ pub(super) fn remove_attributes(s: &mut Session, p: &Value) -> Result<Value> {
                 {
                     let mut fresh = def.instance();
                     filmcraft_project::resolve_auto_points(&mut fresh, frame, sizes.get(c).copied().unwrap_or(frame));
+                    fresh.instance_id = slot.instance_id;
                     *slot = fresh;
                 }
             }

@@ -49,6 +49,20 @@ pub struct OfflineMedia {
     pub error: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct SourcePaths(Arc<HashMap<String, Option<PathBuf>>>);
+impl SourcePaths {
+    pub fn follow(&self, path: &str) -> Result<String, crate::doc_path::NotFollowed> {
+        if cfg!(target_arch = "wasm32") {
+            return Ok(path.to_string());
+        }
+        match self.0.get(path) {
+            Some(document) => crate::doc_path::resolve(path, document.as_deref()),
+            None => Ok(path.to_string()),
+        }
+    }
+}
+
 pub struct MediaPool {
     /// item → (reference key, source)
     sources: RwLock<HashMap<ItemId, (String, SharedSource)>>,
@@ -61,7 +75,7 @@ pub struct MediaPool {
     pub openers: RwLock<Vec<Opener>>,
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
-    stored: RwLock<HashMap<String, Option<PathBuf>>>,
+    stored: RwLock<Arc<HashMap<String, Option<PathBuf>>>>,
 }
 
 impl Default for MediaPool {
@@ -199,18 +213,18 @@ impl MediaPool {
         let document = document.filter(|d| !d.is_empty()).map(PathBuf::from);
         let mut stored = self.stored.write().unwrap_or_else(PoisonError::into_inner);
         for p in paths {
-            stored.entry(p).or_insert_with(|| document.clone());
+            Arc::make_mut(&mut stored).entry(p).or_insert_with(|| document.clone());
         }
     }
 
     /// Forget the stored paths (a new project).
     pub fn clear_stored(&self) {
-        self.stored.write().unwrap_or_else(PoisonError::into_inner).clear();
+        *self.stored.write().unwrap_or_else(PoisonError::into_inner) = Arc::default();
     }
 
     /// The user picked `path` in this session (import, Link Media): open it as given.
     pub fn allow(&self, path: &str) {
-        self.stored.write().unwrap_or_else(PoisonError::into_inner).remove(path);
+        Arc::make_mut(&mut self.stored.write().unwrap_or_else(PoisonError::into_inner)).remove(path);
     }
 
     /// The file to open for `path`, a media or proxy path of the project: a stored path as
@@ -220,10 +234,12 @@ impl MediaPool {
         if cfg!(target_arch = "wasm32") {
             return Ok(path.to_string());
         }
-        match self.stored.read().unwrap_or_else(PoisonError::into_inner).get(path) {
-            Some(document) => crate::doc_path::resolve(path, document.as_deref()),
-            None => Ok(path.to_string()),
-        }
+        self.path_snapshot().follow(path)
+    }
+
+    /// Cheap fixed document-path resolution for asynchronous readers and source-write guards.
+    pub(crate) fn path_snapshot(&self) -> SourcePaths {
+        SourcePaths(self.stored.read().unwrap_or_else(PoisonError::into_inner).clone())
     }
 
     /// [`Self::follow`] as a media error (a refused path is a missing file).

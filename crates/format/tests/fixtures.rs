@@ -179,10 +179,14 @@ pub fn big_project(n: usize) -> Project {
         a.duration = dur;
         a.link = Some(next);
         next += 2;
+        for effect in v.effects.iter_mut().chain(a.effects.iter_mut()) {
+            effect.instance_id = 0;
+        }
         seq.video_tracks[track].items.push(v);
         seq.audio_tracks[track].items.push(a);
     }
     p.next_id = next;
+    p.ensure_effect_instance_ids().unwrap();
     p
 }
 
@@ -232,6 +236,8 @@ fn v8_loads_without_transcripts_and_v9_roundtrips_them() {
     t.words.push(filmcraft_project::Word::new("Hello", Tick(0), Tick(1000)));
     t.words[0].speaker = Some(0);
     t.normalize();
+    t.ensure_word_ids().unwrap();
+    p.transcript_word_counters.insert(ItemId(7), t.next_word_id);
     p.transcripts.insert(ItemId(7), std::sync::Arc::new(t));
     let again = decode(&encode(&p, true)).unwrap();
     // the transcript's key is an id in use, so new ids start past it (#2809)

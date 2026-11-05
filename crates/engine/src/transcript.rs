@@ -109,19 +109,84 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
 }
 
 /// Mono 16 kHz audio of a media item (None: no audio).
-fn item_audio(s: &Session, item: ItemId) -> Option<Vec<f32>> {
-    let dur = match &s.project.item(item)?.kind {
+/// Recognition never buffers a whole recording. Bound decoded channel samples as well as time:
+/// a multi-channel source needs shorter windows than mono audio to keep the same memory budget.
+fn transcribe_item(s: &Session, item: ItemId, t: &dyn Transcriber, opts: &Options) -> Result<Option<Transcript>> {
+    let duration = match &s.project.item(item).ok_or_else(|| bad("transcript.generate", "source missing"))?.kind {
         ItemKind::Media(m) => m.duration(),
-        _ => return None,
+        _ => return Ok(None),
     };
-    let src = s.source(item)?;
-    if !src.info().has_audio() {
-        return None;
+    let Some(source) = s.media.own_source(&s.project, item, s.services.as_ref()).or_else(|| s.source(item)) else { return Ok(None) };
+    let Some(stream) = source.info().audio_streams.first() else { return Ok(None) };
+    let channels = usize::try_from(stream.channels).map_err(|_| bad("transcript.generate", "invalid channel count"))?;
+    if channels == 0 || channels > 256 || duration < Tick::ZERO || duration > Tick(TICKS_PER_SECOND * 86_400) {
+        return Err(bad("transcript.generate", "speech input must have1–256 channels and at most24 hours"));
     }
     let sr = filmcraft_speech::SAMPLE_RATE;
-    let len = dur.to_units_floor(sr as i64).max(0) as usize;
-    let buf = src.audio(0, len, sr).ok()?;
-    Some(filmcraft_speech::downmix(&buf.channels))
+    let frames = duration.to_units_floor(i64::from(sr));
+    let chunk =
+        (usize::try_from(sr).map_err(|_| bad("transcript.generate", "invalid speech sample rate"))?.saturating_mul(300)).min(8_000_000 / channels).max(1);
+    let count = frames.saturating_add(chunk as i64 - 1) / chunk as i64;
+    if count > 4096 {
+        return Err(bad("transcript.generate", "source exceeds4096 bounded speech windows; split the recording into smaller source items"));
+    }
+    let mut combined = Transcript::default();
+    let mut offset = 0i64;
+    let mut index = 0usize;
+    while offset < frames {
+        crate::workflow::check_cancelled(s)?;
+        if let Some(progress) = &s.workflow_progress {
+            progress.done.fetch_max(200 + (200 * index as u64) / (count as u64).max(1), std::sync::atomic::Ordering::Relaxed);
+            *progress.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Recognizing source {} window {}/{}", item.0, index.saturating_add(1), count);
+        }
+        let len = usize::try_from(frames.saturating_sub(offset).min(chunk as i64)).map_err(|_| bad("transcript.generate", "invalid speech window"))?;
+        let audio = source.audio(offset, len, sr).map_err(|e| bad("transcript.generate", format!("source {} audio at sample{offset}: {e}", item.0)))?;
+        if audio.sample_rate != sr || audio.channels.len() != channels || audio.channels.iter().any(|c| c.len() != len || c.iter().any(|s| !s.is_finite())) {
+            return Err(bad("transcript.generate", "decoder returned invalid speech audio"));
+        }
+        let mono = filmcraft_speech::downmix(&audio.channels);
+        let mut part = t.transcribe(&mono, opts, &mut |_, _| crate::workflow::check_cancelled(s).is_ok()).map_err(speech_err)?;
+        part.normalize();
+        append_speech_window(&mut combined, part, Tick::from_units(offset, i64::from(sr)), Tick::from_units(len as i64, i64::from(sr)), index, count > 1)?;
+        offset = offset.checked_add(len as i64).ok_or_else(|| bad("transcript.generate", "speech position overflow"))?;
+        index = index.saturating_add(1);
+    }
+    if count > 1 {
+        combined.source = format!("{} (bounded source windows)", t.id());
+    } else if combined.source.is_empty() {
+        combined.source = t.id();
+    }
+    Ok(Some(combined))
+}
+fn append_speech_window(out: &mut Transcript, mut part: Transcript, offset: Tick, duration: Tick, index: usize, chunked: bool) -> Result<()> {
+    if out.words.len().saturating_add(part.words.len()) > 1_000_000 {
+        return Err(bad("transcript.generate", "transcript exceeds one million words"));
+    }
+    if out.language.is_empty() {
+        out.language = part.language.clone();
+    } else if !part.language.is_empty() && out.language != part.language {
+        out.language = "mul".into();
+    }
+    if out.source.is_empty() {
+        out.source = part.source.clone();
+    }
+    let base = out.speakers.len();
+    for speaker in part.speakers {
+        if out.speakers.len() >= filmcraft_project::transcript::MAX_SPEAKERS as usize {
+            break;
+        }
+        out.speakers
+            .push(filmcraft_project::Speaker { name: if chunked { format!("Window {} · {}", index.saturating_add(1), speaker.name) } else { speaker.name } });
+    }
+    part.words.retain(|w| w.start < duration && w.end >= Tick::ZERO);
+    for mut word in part.words {
+        word.start = Tick(word.start.0.clamp(0, duration.0).saturating_add(offset.0));
+        word.end = Tick(word.end.0.clamp(0, duration.0).saturating_add(offset.0)).max(word.start);
+        word.id = 0;
+        word.speaker = word.speaker.and_then(|id| base.checked_add(id as usize)).filter(|id| *id < out.speakers.len()).and_then(|id| u32::try_from(id).ok());
+        out.words.push(word);
+    }
+    Ok(())
 }
 
 fn speech_err(e: SpeechError) -> EngineError {
@@ -165,12 +230,12 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut done: Vec<(ItemId, Transcript)> = Vec::new();
     let mut skipped = Vec::new();
     for item in items {
-        let Some(audio) = item_audio(s, item) else {
+        let Some(mut tr) = transcribe_item(s, item, t.as_ref(), &opts)? else {
             skipped.push(item.0);
             continue;
         };
-        let mut tr = t.transcribe(&audio, &opts, &mut |_, _| true).map_err(speech_err)?;
         tr.normalize();
+        s.project.prepare_transcript_ids(item, &mut tr, false).map_err(|e| bad("transcript.generate", e))?;
         done.push((item, tr));
     }
     if done.is_empty() {
@@ -182,7 +247,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     s.edit("Transcribe", move |pr, _| {
         for (i, t) in done {
-            pr.transcripts.insert(i, Arc::new(t));
+            pr.store_transcript(i, t);
         }
         Ok(())
     })?;
@@ -227,10 +292,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         t.source = "imported".into();
     }
     t.normalize();
+    s.project.prepare_transcript_ids(item, &mut t, true).map_err(|e| bad("transcript.set", e))?;
     t.check().map_err(|e| bad("transcript.set", e))?;
     let n = t.words.len();
     s.edit("Set Transcript", move |pr, _| {
-        pr.transcripts.insert(item, Arc::new(t));
+        pr.store_transcript(item, t);
         Ok(())
     })?;
     Ok(json!({"item": item.0, "words": n}))
@@ -247,15 +313,19 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.edit("Delete Transcript", move |pr, _| {
         for i in items {
-            pr.transcripts.remove(&i);
+            if let Some(t) = pr.transcripts.remove(&i) {
+                let high = t.next_word_id.max(t.words.iter().map(|w| w.id).max().unwrap_or(0));
+                let counter = pr.transcript_word_counters.entry(i).or_default();
+                *counter = (*counter).max(high);
+            }
         }
         Ok(())
     })?;
     Ok(json!({"deleted": n}))
 }
 
-fn word_json(i: usize, w: &SeqWord) -> Value {
-    json!({"i": i, "text": w.text, "start": w.start.0, "end": w.end.0, "speaker": w.speaker, "clip": w.clip.0, "item": w.item.0, "confidence": w.confidence})
+fn word_json(s: &Session, i: usize, w: &SeqWord) -> Value {
+    json!({"i": i, "sourceWordId":s.project.transcripts.get(&w.item).and_then(|t|t.words.get(w.index)).map(|w|w.id), "text": w.text, "start": w.start.0, "end": w.end.0, "speaker": w.speaker, "clip": w.clip.0, "item": w.item.0, "confidence": w.confidence})
 }
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
@@ -281,7 +351,7 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let current = tx::word_at(&words, s.playhead());
     Ok(json!({
-        "words": words.iter().enumerate().map(|(i, w)| word_json(i, w)).collect::<Vec<_>>(),
+        "words": words.iter().enumerate().map(|(i, w)| word_json(s, i, w)).collect::<Vec<_>>(),
         "paragraphs": paras,
         "speakers": speakers,
         "current": current,
@@ -447,20 +517,46 @@ fn models(_: &mut Session, _: &Value) -> Result<Value> {
 
 /// Download a catalogue model into `<data dir>/models` (feature `speech-download`). Hosts show
 /// the size, source and licence (`transcript.models`) and ask before running this.
-fn download_model(_: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn download_model_now(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_p(p, "model").unwrap_or(filmcraft_speech::models::DEFAULT_MODEL);
     let m = filmcraft_speech::models::find(id).ok_or_else(|| speech_err(SpeechError::UnknownModel(id.into())))?;
     let dir = models_dir().ok_or_else(|| EngineError::Other("no data directory for speech models".into()))?;
     #[cfg(feature = "speech-download")]
     {
-        filmcraft_speech::models::download(&dir, m, &mut |_, _, _| true).map_err(speech_err)?;
+        filmcraft_speech::models::download(&dir, m, &mut |done, total, file| {
+            if let Some(progress) = &s.workflow_progress {
+                progress.total.store(total.max(1), std::sync::atomic::Ordering::Relaxed);
+                progress.done.store(done, std::sync::atomic::Ordering::Relaxed);
+                *progress.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Downloading {file}");
+            }
+            crate::workflow::check_cancelled(s).is_ok()
+        })
+        .map_err(speech_err)?;
         Ok(json!({"model": m.id, "dir": filmcraft_speech::models::model_dir(&dir, m).to_string_lossy()}))
     }
     #[cfg(not(feature = "speech-download"))]
     {
-        let _ = (m, dir);
+        let _ = (s, m, dir);
         Err(EngineError::Other("model downloads are not available in this build (built without the `speech-download` feature)".into()))
     }
+}
+
+fn download_model(s: &mut Session, p: &Value) -> Result<Value> {
+    let object = p.as_object().ok_or_else(|| bad("transcript.downloadModel", "parameters must be an object"))?;
+    if object.keys().any(|key| !matches!(key.as_str(), "model" | "wait"))
+        || p.get("wait").is_some_and(|v| !v.is_boolean())
+        || p.get("model").is_some_and(|v| !v.is_string())
+    {
+        return Err(bad("transcript.downloadModel", "give model and optional boolean wait"));
+    }
+    let model = p["model"].as_str().unwrap_or(filmcraft_speech::models::DEFAULT_MODEL).to_string();
+    let task = crate::workflow::download_model_background(s, model.clone())?;
+    let mut result = json!({"job":task.job.id,"model":model,"inputRevision":s.revision,"poll":"jobs.get","cancel":"jobs.cancel"});
+    if p["wait"].as_bool().unwrap_or(false) {
+        let downloaded = task.receiver.recv().map_err(|_| bad("transcript.downloadModel", "download worker disconnected"))??;
+        result["result"] = downloaded;
+    }
+    Ok(result)
 }
 
 pub fn commands() -> Vec<CommandSpec> {
@@ -478,7 +574,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.set",
             "Import Transcript",
             &[],
-            r#"{"item":id,"transcript":{"language":str,"speakers":[{"name":str}],"words":[{"text":str,"start":tick,"end":tick,"speaker":n?}]}}"#,
+            r#"{"item":id,"transcript":{"language":str,"speakers":[{"name":str}],"words":[{"id":sourceWordId?,"text":str,"start":tick,"end":tick,"speaker":n?}]}}"#,
             always,
             set,
             true,
@@ -487,7 +583,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("transcript.inspect", "Inspect Transcript", &[], r#"{"paragraphGapSeconds":f?}"#, always, inspect, false),
         spec("transcript.search", "Search Transcript", &[], r#"{"query":str}"#, always, search, false),
         spec("transcript.models", "List Speech Models", &[], "{}", always, models, false),
-        spec("transcript.downloadModel", "Download Speech Model", &[], r#"{"model":"whisper-base"?}"#, can_download, download_model, true),
+        spec("transcript.downloadModel", "Download Speech Model", &[], r#"{"model":"whisper-base"?,"wait":bool=false}"#, can_download, download_model, true),
         spec("transcript.select", "Mark Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, select, true),
         spec("transcript.extract", "Extract Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, |s, p| extract_or_lift(s, p, true), true),
         spec("transcript.lift", "Lift Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, |s, p| extract_or_lift(s, p, false), true),

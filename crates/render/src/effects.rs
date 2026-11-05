@@ -1331,7 +1331,7 @@ pub fn apply_look(look: u32, c: [f32; 3]) -> [f32; 3] {
     }
 }
 
-fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+pub(crate) fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     const N: usize = 1024;
     let (creative_on, curves_on, wheels_on) = (on(e, "creative_on"), on(e, "curves_on"), on(e, "wheels_on"));
     let lut = |id: &str| curve_param(e, id).filter(|c| curves_on && !is_identity_curve(c)).map(|c| curve_lut(&c, N));
@@ -1454,7 +1454,7 @@ fn hsl_key(v: [f32; 3], hc: f32, hr: f32, smin: f32, lmin: f32, lmax: f32, soft:
 ///   resolution, scaled with the playback resolution) mixed in by the amount.
 /// - **Blur** softens the key's edges: a Gaussian (σ up to 20 px at full resolution, three box
 ///   passes) on the key.
-fn hsl_secondary(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+pub(crate) fn hsl_secondary(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     if !b(e, "hsl_on") {
         return;
     }
@@ -1679,6 +1679,26 @@ mod lumetri_cpu_parity_tests {
     #[test]
     fn lumetri_gpu_op_matches_original_fn_lumetri_cpu() {
         let cases: &[(&str, Vec<(&str, ParamValue)>)] = &[
+            (
+                "curves-and-wheels",
+                vec![
+                    ("curve_red", ParamValue::Curve(vec![[0.0, 0.1], [0.4, 0.7], [1.0, 0.9]])),
+                    ("hue_vs_sat", ParamValue::Curve(vec![[0.1, 0.3], [0.6, 0.7]])),
+                    ("wheel_midtones", ParamValue::Vec2(Vec2::new(0.2, -0.1))),
+                    ("wheel_shadows_l", fl(12.0)),
+                ],
+            ),
+            (
+                "hsl-refined",
+                vec![
+                    ("hsl_on", ParamValue::Bool(true)),
+                    ("hsl_hue_range", fl(100.0)),
+                    ("hsl_temp", fl(30.0)),
+                    ("hsl_sat", fl(150.0)),
+                    ("hsl_denoise", fl(60.0)),
+                    ("hsl_blur", fl(45.0)),
+                ],
+            ),
             (
                 "basic",
                 vec![

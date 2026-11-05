@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/*", "xtask"]
 
 [workspace.package]
-version = "0.17.0-arian.1"
+version = "0.17.1-arian.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -49,6 +49,7 @@ filmcraft-interchange = { path = "crates/interchange" }
 filmcraft-text = { path = "crates/text" }
 filmcraft-captions = { path = "crates/captions" }
 filmcraft-speech = { path = "crates/speech" }
+filmcraft-vision = { path = "crates/vision" }
 filmcraft-tts = { path = "crates/tts" }
 filmcraft-tts-text = { path = "crates/tts-text" }
 filmcraft-render = { path = "crates/render" }

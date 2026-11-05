@@ -36,18 +36,34 @@ fn pair_in_an_empty_sequence(s: &mut Session, seconds: f64) -> (TrackId, TrackIt
     (q.video_tracks[0].id, v, q.audio_tracks[0].id, a)
 }
 
+// Independent executions carry their actual UTC audit timestamps; all other document fields,
+// including activity identities, commands and revisions, remain part of these comparisons.
+fn without_activity_times(project: &filmcraft_project::Project) -> filmcraft_project::Project {
+    let mut p = project.clone();
+    for event in &mut p.review.activity {
+        event.created_utc.clear();
+    }
+    p
+}
+fn history_without_activity_times(
+    entries: &[(String, std::sync::Arc<filmcraft_project::Project>, Option<String>)],
+) -> Vec<(String, filmcraft_project::Project, Option<String>)> {
+    entries.iter().map(|(label, p, origin)| (label.clone(), without_activity_times(p), origin.clone())).collect()
+}
+
 fn assert_selection_edit_matches_control(s: &mut Session, selection: Vec<ClipId>, command: &str, params: serde_json::Value) {
     let before = s.project.clone();
     let undo = s.history.undo.len();
     let mut control = Session { project: s.project.clone(), state: s.state.clone(), history: s.history.clone(), media: s.media.clone(), ..Session::default() };
+    control.revision = s.revision;
     control.state.selection = selection;
     let expected = control.execute(command, params.clone()).unwrap();
     let actual = s.execute(command, params).unwrap();
     assert_eq!(actual, expected, "{command} returns the unique-selection result");
-    assert_eq!(s.project, control.project, "{command} produces the complete unique-selection project");
+    assert_eq!(without_activity_times(&s.project), without_activity_times(&control.project), "{command} produces the complete unique-selection project");
     assert_eq!(s.history.undo.len(), undo + 1, "the edit is one undo step");
-    assert_eq!(s.history.undo, control.history.undo);
-    assert_eq!(s.history.redo, control.history.redo);
+    assert_eq!(history_without_activity_times(&s.history.undo), history_without_activity_times(&control.history.undo));
+    assert_eq!(history_without_activity_times(&s.history.redo), history_without_activity_times(&control.history.redo));
     assert_eq!(s.history.merge_key, control.history.merge_key);
     let q = s.active_sequence().unwrap();
     let ids: Vec<ClipId> = q.all_tracks().flat_map(|t| t.items.iter().map(|i| i.id)).collect();
@@ -57,16 +73,16 @@ fn assert_selection_edit_matches_control(s: &mut Session, selection: Vec<ClipId>
     s.execute("edit.undo", json!({})).unwrap();
     control.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.project, before, "undo restores the entire pre-edit project");
-    assert_eq!(s.project, control.project);
-    assert_eq!(s.history.undo, control.history.undo);
-    assert_eq!(s.history.redo, control.history.redo);
+    assert_eq!(without_activity_times(&s.project), without_activity_times(&control.project));
+    assert_eq!(history_without_activity_times(&s.history.undo), history_without_activity_times(&control.history.undo));
+    assert_eq!(history_without_activity_times(&s.history.redo), history_without_activity_times(&control.history.redo));
     s.active_sequence().unwrap().check().unwrap();
     s.execute("edit.redo", json!({})).unwrap();
     control.execute("edit.redo", json!({})).unwrap();
     assert_eq!(s.project, after, "redo restores the entire edited project");
-    assert_eq!(s.project, control.project);
-    assert_eq!(s.history.undo, control.history.undo);
-    assert_eq!(s.history.redo, control.history.redo);
+    assert_eq!(without_activity_times(&s.project), without_activity_times(&control.project));
+    assert_eq!(history_without_activity_times(&s.history.undo), history_without_activity_times(&control.history.undo));
+    assert_eq!(history_without_activity_times(&s.history.redo), history_without_activity_times(&control.history.redo));
     s.active_sequence().unwrap().check().unwrap();
 }
 

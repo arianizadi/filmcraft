@@ -2,7 +2,7 @@
 
 Independent fork of [storytold/filmcraft](https://github.com/storytold/filmcraft).
 
-[Agent editing workflow](docs/agent-workflow.md) · [Exact frame inspection](docs/visual-inspection.md) · [Format compatibility](docs/format-compatibility.md)
+[Automatic editing and review](docs/agent-workflow.md) · [Wishlist implementation](docs/wishlist-progress.md) · [Exact frame inspection](docs/visual-inspection.md) · [Format compatibility](docs/format-compatibility.md)
 
 
 

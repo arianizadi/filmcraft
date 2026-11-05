@@ -478,6 +478,7 @@ fn set(e: &mut EffectInstance, id: &str, v: ParamValue) {
 /// missing from the registry; `set` adds the ones the constructors fill in).
 fn layer_instance(id: &str) -> EffectInstance {
     crate::effect::find_effect(id).map(crate::effect::EffectDef::instance).unwrap_or_else(|| EffectInstance {
+        instance_id: 0,
         effect: id.to_string(),
         enabled: true,
         params: Default::default(),

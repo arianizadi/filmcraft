@@ -1,6 +1,7 @@
 //! Desktop review of immutable agent proposals. Permission state is deliberately outside UiState:
 //! generic `ui.set` cannot grant a remote agent additional capabilities.
 
+use std::collections::BTreeSet;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use filmcraft_engine::{Session, inspection, operations::Permission};
@@ -12,9 +13,17 @@ use crate::FilmcraftApp;
 #[derive(Default)]
 pub struct AgentReview {
     pub open: bool,
+    workflow: crate::agent_workflow::AgentWorkflow,
     compact: bool,
     selected: Option<u64>,
     frame: i64,
+    subset_plan: Option<u64>,
+    selected_steps: BTreeSet<usize>,
+    checkpoint_name: String,
+    checkpoint_diff: Option<Value>,
+    annotation_text: String,
+    profile: filmcraft_engine::project::review::EditingProfile,
+    profile_overrides: String,
     pending: Option<(PreviewKey, Receiver<Result<RenderedPair, String>>)>,
     preview: Option<PreviewTextures>,
     message: Option<String>,
@@ -283,6 +292,194 @@ fn preview_controls(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut e
     }
 }
 
+fn subset_controls(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut egui::Ui, report: &Value) {
+    let Some(id) = report["plan"].as_u64() else { return };
+    let Some(commands) = report["commands"].as_array() else { return };
+    if review.subset_plan != Some(id) {
+        review.subset_plan = Some(id);
+        review.selected_steps = (0..commands.len()).collect();
+    }
+    let collapse = egui::CollapsingHeader::new("Choose individual proposal steps").id_salt(("agentReview.steps", id)).show(ui, |ui| {
+        ui.label("Selected steps create a fresh proposal. Review its changes and frames before approving.");
+        for (index, command) in commands.iter().enumerate() {
+            let result = &report["steps"][index];
+            let label = if command["id"] == "transcript.cutRange" {
+                format!(
+                    "Cut words {}–{} · clip {} · {} linked clips",
+                    command["params"]["fromWordId"],
+                    command["params"]["toWordId"],
+                    command["params"]["clip"],
+                    result["linked"].as_array().map_or(0, Vec::len)
+                )
+            } else {
+                format!("Step {}: {}", index + 1, command["id"].as_str().unwrap_or("edit"))
+            };
+            let mut selected = review.selected_steps.contains(&index);
+            let response = ui.checkbox(&mut selected, &label);
+            app.auto.add_response(&format!("agentReview.step.{id}.{index}"), &response, &label);
+            if selected {
+                review.selected_steps.insert(index);
+            } else {
+                review.selected_steps.remove(&index);
+            }
+            if command["id"] == "transcript.cutRange" {
+                ui.small(format!("Affected tracks: {}", concise_json(&result["tracks"])));
+            }
+        }
+        if button(
+            app,
+            ui,
+            "agentReview.subset",
+            "Create selected preview",
+            !review.selected_steps.is_empty() && report["status"] == "staged" && report["stale"] == false,
+        )
+        .clicked()
+        {
+            match app.session.execute("agent.subset", json!({"plan":id,"steps":review.selected_steps})) {
+                Ok(report) => {
+                    review.selected = report["plan"].as_u64();
+                    review.preview = None;
+                    review.message = Some("Created a new exact proposal from the selected steps. Review it before approval.".into());
+                }
+                Err(e) => review.message = Some(e.to_string()),
+            }
+        }
+    });
+    app.auto.add_response("agentReview.steps", &collapse.header_response, "Choose individual proposal steps");
+}
+
+fn persistent_review(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut egui::Ui) {
+    let collapse=egui::CollapsingHeader::new("Checkpoints and timeline notes").id_salt("agentReview.savedReview").show(ui,|ui|{
+        ui.horizontal(|ui|{let response=ui.text_edit_singleline(&mut review.checkpoint_name);app.auto.add_response("agentReview.checkpoint.name",&response,"Checkpoint name");
+            if button(app,ui,"agentReview.checkpoint.save","Save checkpoint",!review.checkpoint_name.trim().is_empty()).clicked(){match app.session.execute("review.checkpoint",json!({"name":review.checkpoint_name})){Ok(_)=>{review.checkpoint_name.clear();review.message=Some("Checkpoint saved in the project. Save the project to retain it after reopening.".into())},Err(e)=>review.message=Some(e.to_string())}}
+        });
+        for c in app.session.project.review.checkpoints.clone(){ui.horizontal(|ui|{ui.label(format!("{} · revision {}",c.name,c.revision));
+            if button(app,ui,&format!("agentReview.checkpoint.diff.{}",c.id),"Compare",true).clicked(){match app.session.execute("review.diff",json!({"checkpoint":c.id})){Ok(mut diff)=>{diff["plan"]=json!(format!("checkpoint-{}",c.id));review.checkpoint_diff=Some(diff)},Err(e)=>review.message=Some(e.to_string())}}
+            if button(app,ui,&format!("agentReview.checkpoint.delete.{}",c.id),"Delete checkpoint",true).clicked(){match app.session.execute("review.deleteCheckpoint",json!({"checkpoint":c.id})){Ok(_)=>review.checkpoint_diff=None,Err(e)=>review.message=Some(e.to_string())}}
+        });}
+        if let Some(diff)=&review.checkpoint_diff {ui.label(format!("Changes since {}",diff["name"].as_str().unwrap_or("checkpoint")));changes(app,ui,diff);}
+        let response=ui.text_edit_multiline(&mut review.annotation_text);app.auto.add_response("agentReview.annotation.text",&response,"Timeline note");
+        if button(app,ui,"agentReview.annotation.add","Add note at playhead",!review.annotation_text.trim().is_empty()&&app.session.state.active_sequence.is_some()).clicked(){match app.session.execute("review.annotate",json!({"text":review.annotation_text,"kind":"note"})){Ok(_)=>review.annotation_text.clear(),Err(e)=>review.message=Some(e.to_string())}}
+        let active=app.session.state.active_sequence;
+        for a in app.session.project.review.annotations.clone().into_iter().filter(|a|Some(a.sequence)==active){ui.label(format!("{} · {} · {}",a.kind,a.status,a.text));ui.horizontal(|ui|{
+            if button(app,ui,&format!("agentReview.annotation.seek.{}",a.id),"Go to note",true).clicked(){app.session.set_playhead(a.start);}
+            for (label,status) in [("Accept","accepted"),("Dismiss","dismissed")]{if button(app,ui,&format!("agentReview.annotation.{status}.{}",a.id),label,a.status=="open").clicked(){match app.session.execute("review.annotate",json!({"annotation":a.id,"sequence":a.sequence.0,"start":a.start.0,"end":a.end.0,"text":a.text,"kind":a.kind,"author":a.author,"status":status})){Ok(_)=>{},Err(e)=>review.message=Some(e.to_string())}}}
+        });}
+    });
+    app.auto.add_response("agentReview.savedReview", &collapse.header_response, "Checkpoints and timeline notes");
+    profile_controls(app, review, ui);
+    let collapse = egui::CollapsingHeader::new("Saved project activity").id_salt("agentReview.savedActivity").show(ui, |ui| {
+        for event in app.session.project.review.activity.iter().rev().take(100) {
+            ui.label(format!("{} · {} · revision {} → {}", event.created_utc, event.label, event.before_revision, event.after_revision));
+        }
+    });
+    app.auto.add_response("agentReview.savedActivity", &collapse.header_response, "Saved project activity");
+}
+fn profile_controls(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut egui::Ui) {
+    let collapse = egui::CollapsingHeader::new("Editing profiles").id_salt("agentReview.profiles").show(ui, |ui| {
+        let profiles = app.session.project.review.profiles.clone();
+        for (name, versions) in profiles {
+            if let Some(profile) = versions.last()
+                && button(app, ui, &format!("agentReview.profile.load.{name}"), &format!("Load {name} v{}", profile.version), true).clicked()
+            {
+                review.profile = profile.clone();
+            }
+        }
+        ui.label("Profile name");
+        let response = ui.text_edit_singleline(&mut review.profile.name);
+        app.auto.add_response("agentReview.profile.name", &response, "Profile name");
+        for (id, label, text) in [
+            ("skin", "Skin tone preference", &mut review.profile.skin_tone_preference),
+            ("pacing", "Pacing", &mut review.profile.pacing),
+            ("font", "Caption font", &mut review.profile.caption_style.font),
+        ] {
+            ui.label(label);
+            let response = ui.text_edit_singleline(text);
+            app.auto.add_response(&format!("agentReview.profile.{id}"), &response, label);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Pause padding (ticks)");
+            let response = ui.add(egui::DragValue::new(&mut review.profile.pause_padding_ticks).range(0..=filmcraft_engine::time::TICKS_PER_SECOND * 60));
+            app.auto.add_response("agentReview.profile.padding", &response, "Pause padding ticks");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Loudness (LUFS)");
+            let response = ui.add(egui::DragValue::new(&mut review.profile.loudness_lufs).range(-60.0..=0.0));
+            app.auto.add_response("agentReview.profile.loudness", &response, "Loudness LUFS");
+            ui.label("Caption size");
+            let response = ui.add(egui::DragValue::new(&mut review.profile.caption_style.size).range(1.0..=1000.0));
+            app.auto.add_response("agentReview.profile.captionSize", &response, "Caption size");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Delivery width / height");
+            for (id, value) in [("width", &mut review.profile.delivery.width), ("height", &mut review.profile.delivery.height)] {
+                let response = ui.add(egui::DragValue::new(value).range(1..=32768));
+                app.auto.add_response(&format!("agentReview.profile.{id}"), &response, id);
+            }
+        });
+        ui.label("One-off overrides (optional JSON object)");
+        let response = ui.text_edit_multiline(&mut review.profile_overrides);
+        app.auto.add_response("agentReview.profile.overrides", &response, "One-off profile overrides");
+        ui.horizontal(|ui| {
+            if button(app, ui, "agentReview.profile.save", "Save new profile version", !review.profile.name.trim().is_empty()).clicked() {
+                match app.session.execute("profile.save", json!({"profile":review.profile})) {
+                    Ok(p) => match serde_json::from_value(p) {
+                        Ok(profile) => {
+                            review.profile = profile;
+                            review.message = Some("Profile version saved.".into());
+                        }
+                        Err(e) => review.message = Some(e.to_string()),
+                    },
+                    Err(e) => review.message = Some(e.to_string()),
+                }
+            }
+            if button(app, ui, "agentReview.profile.propose", "Propose profile", app.session.project.review.profiles.contains_key(&review.profile.name))
+                .clicked()
+            {
+                let overrides =
+                    if review.profile_overrides.trim().is_empty() { Ok(json!({})) } else { serde_json::from_str::<Value>(&review.profile_overrides) };
+                match overrides {
+                    Ok(overrides) => match app.session.execute("profile.plan", json!({"name":review.profile.name,"overrides":overrides})) {
+                        Ok(p) => {
+                            review.selected = p["plan"].as_u64();
+                            review.preview = None;
+                        }
+                        Err(e) => review.message = Some(e.to_string()),
+                    },
+                    Err(e) => review.message = Some(e.to_string()),
+                }
+            }
+        });
+    });
+    app.auto.add_response("agentReview.profiles", &collapse.header_response, "Editing profiles");
+}
+
+fn quality_findings(app: &mut FilmcraftApp, ui: &mut egui::Ui, plan: u64, qc: &Value) {
+    let Some(findings) = qc["findings"].as_array() else {
+        ui.label(format!("Timeline QC unavailable: {}", qc["error"].as_str().unwrap_or("check coverage details")));
+        return;
+    };
+    let label = format!("Timeline quality findings ({})", findings.len());
+    let collapse = egui::CollapsingHeader::new(&label).id_salt(("agentReview.qc", plan)).show(ui, |ui| {
+        ui.label(format!("Coverage: {}", concise_json(&qc["coverage"])));
+        for (index, finding) in findings.iter().enumerate() {
+            let text = format!(
+                "{} · frame {}–{} · confidence {}",
+                finding["kind"].as_str().unwrap_or("finding"),
+                finding["start"]["frame"],
+                finding["end"]["frame"],
+                finding["confidence"]
+            );
+            let detail = egui::CollapsingHeader::new(&text).id_salt(("agentReview.qc.finding", plan, index)).show(ui, |ui| {
+                let response = ui.monospace(concise_json(finding));
+                app.auto.add_response(&format!("agentReview.qc.{plan}.{index}.details"), &response, "Timeline finding evidence");
+            });
+            app.auto.add_response(&format!("agentReview.qc.{plan}.{index}"), &detail.header_response, &text);
+        }
+    });
+    app.auto.add_response("agentReview.qc", &collapse.header_response, &label);
+}
+
 fn proposal(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut egui::Ui, report: Value) {
     let status = report["status"].as_str().unwrap_or("unknown");
     let stale = report["stale"].as_bool().unwrap_or(true);
@@ -291,11 +488,29 @@ fn proposal(app: &mut FilmcraftApp, review: &mut AgentReview, ui: &mut egui::Ui,
     if stale && status == "staged" {
         ui.label("The project changed. Ask the agent to inspect again and prepare a fresh proposal.");
     }
+    subset_controls(app, review, ui, &report);
+    if let Some(workflow) = report.get("workflow") {
+        ui.label(format!(
+            "{} · {} proposed source ranges",
+            workflow["mode"].as_str().unwrap_or("Automatic edit"),
+            workflow["ranges"].as_array().map_or(0, Vec::len)
+        ));
+        for warning in workflow["warnings"].as_array().into_iter().flatten() {
+            ui.label(warning.as_str().unwrap_or("Review the analysis findings."));
+        }
+        if let Some(qc) = workflow.get("timelineQc") {
+            quality_findings(app, ui, report["plan"].as_u64().unwrap_or(0), qc);
+        }
+        for warning in report["preparation"]["warnings"].as_array().into_iter().flatten() {
+            ui.label(warning.as_str().unwrap_or("Preparation requires review."));
+        }
+    }
     changes(app, ui, &report);
     preview_controls(app, review, ui, &report);
     ui.separator();
     ui.horizontal(|ui| {
-        let eligible = status == "staged" && !stale;
+        let all_steps = report["commands"].as_array().is_none_or(|steps| review.selected_steps.len() == steps.len());
+        let eligible = status == "staged" && !stale && all_steps;
         if button(app, ui, "agentReview.approve", "Approve as one undo step", eligible).clicked()
             && let Some(plan) = review.selected
         {
@@ -342,9 +557,14 @@ pub(crate) fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         if review.compact {
             return;
         }
-        permission_picker(app, ui);
-        ui.separator();
         let scroll = egui::ScrollArea::vertical().id_salt("agentReview.scroll").max_height(ui.available_height()).show(ui, |ui| {
+            permission_picker(app, ui);
+            crate::agent_pairing::show(app, ui);
+            if let Some(plan) = crate::agent_workflow::show(app, &mut review.workflow, ui, review.selected) {
+                review.selected = Some(plan);
+                review.preview = None;
+            }
+            ui.separator();
             let list = app.session.execute("agent.plans", json!({}));
             match list {
                 Ok(list) => {
@@ -381,6 +601,7 @@ pub(crate) fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     ui.label(e.to_string());
                 }
             }
+            persistent_review(app, &mut review, ui);
             if let Some(message) = &review.message {
                 ui.separator();
                 ui.label(message);

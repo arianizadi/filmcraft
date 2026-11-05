@@ -7,7 +7,25 @@
 use serde_json::Value;
 
 const READ_ONLY: &[&str] = &[
+    "analysis.footage",
+    "workflow.status",
+    "motion.templates",
+    "subject.inspect",
+    "library.search",
+    "library.model.status",
+    "library.indexStatus",
+    "qc.timeline",
+    "qc.export",
+    "library.index",
+    "review.checkpoints",
+    "review.diff",
+    "review.annotations",
+    "review.activity",
+    "profile.list",
+    "profile.get",
+    "profile.resolve",
     "agent.session",
+    "agent.connections",
     "agent.operation",
     "agent.activity",
     "agent.inspect",
@@ -15,6 +33,11 @@ const READ_ONLY: &[&str] = &[
     "agent.plans",
     "render.frames",
     "grade.get",
+    "gallery.list",
+    "gallery.get",
+    "grade.version.list",
+    "grade.look.list",
+    "grade.cdl.inspect",
     "scopes.read",
     "command.list",
     "project.inspect",
@@ -27,6 +50,7 @@ const READ_ONLY: &[&str] = &[
     "file.listAutoSaves",
     "prefs.get",
     "jobs.list",
+    "jobs.get",
     "perf.stats",
     "clip.audioPeak",
     "sequence.renderBar",
@@ -73,6 +97,7 @@ const READ_ONLY: &[&str] = &[
     "project.notes",
     "tts.voices",
     "tts.inspect",
+    "transcript.sourceWords",
     "transcript.inspect",
     "transcript.search",
     "transcript.models",
@@ -95,11 +120,26 @@ const READ_ONLY: &[&str] = &[
 ];
 
 // Optional file output is a write even though the no-path command only returns image bytes.
-const OPTIONAL_OUTPUT: &[&str] = &["lumetri.presetThumbnails", "graphics.template.thumbnail"];
+const OPTIONAL_OUTPUT: &[&str] = &["lumetri.presetThumbnails", "graphics.template.thumbnail", "grade.cdl.export", "grade.bakeLut"];
 
 // These historically carry journal:false. They must never inherit query access from that flag.
 #[cfg(test)]
 const SIDE_EFFECT_QUERIES: &[&str] = &[
+    "library.model.download",
+    "library.model.load",
+    "library.model.unload",
+    "library.indexAsync",
+    "library.embeddings",
+    "library.load",
+    "library.clear",
+    "motion.plan",
+    "subject.trackPlan",
+    "subject.correctPlan",
+    "subject.reframePlan",
+    "library.selectsPlan",
+    "library.brollPlan",
+    "library.save",
+    "presets.scan",
     "lut.export",
     "file.reveal",
     "file.projectManager",
@@ -119,6 +159,14 @@ const SIDE_EFFECT_QUERIES: &[&str] = &[
     "tts.render",
     "tts.downloadVoices",
     "export.queue.list",
+    "agent.subset",
+    "transcript.proposeCuts",
+    "profile.plan",
+    "profile.layout",
+    "workflow.autoEdit",
+    "workflow.prepare",
+    "workflow.prepareAsync",
+    "agent.pairRequest",
     "agent.plan",
     "agent.discard",
 ];
@@ -138,6 +186,30 @@ pub fn is_read_only(id: &str, params: &Value) -> bool {
         return params.get("dryRun").and_then(Value::as_bool) == Some(true);
     }
     false
+}
+
+/// Commands that prepare isolated proposals without applying a live project edit.
+pub fn is_proposal(id: &str) -> bool {
+    matches!(
+        id,
+        "agent.plan"
+            | "library.model.load"
+            | "library.indexAsync"
+            | "agent.discard"
+            | "agent.subset"
+            | "transcript.proposeCuts"
+            | "profile.plan"
+            | "profile.layout"
+            | "library.selectsPlan"
+            | "library.brollPlan"
+            | "workflow.autoEdit"
+            | "workflow.prepare"
+            | "workflow.prepareAsync"
+            | "motion.plan"
+            | "subject.trackPlan"
+            | "subject.correctPlan"
+            | "subject.reframePlan"
+    )
 }
 
 #[cfg(test)]

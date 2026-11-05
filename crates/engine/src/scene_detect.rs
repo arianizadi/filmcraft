@@ -137,9 +137,10 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("none of the selected clips is a video clip with media to analyse".into()));
     }
     let total: usize = work.iter().map(|w| w.frames.len()).sum();
-    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+
     let label = format!("Scene Edit Detection ({} clip{})", work.len(), if work.len() == 1 { "" } else { "s" });
-    let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, label)?;
+    let id = job.id;
     job.progress.total.store(total as u64, std::sync::atomic::Ordering::Relaxed);
     let results: Arc<Mutex<Option<Vec<ClipScenes>>>> = Arc::default();
     let (prog, res, out) = (job.progress.clone(), job.result.clone(), results.clone());
@@ -204,7 +205,7 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         *lock(&res) = Some(r);
         prog.finished.store(true, Ordering::Relaxed);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     s.scene_jobs.push(PendingScene { job: id, seq: seq_id, apply, results: results.clone() });
     let wait = bool_p(p, "wait").unwrap_or(false);
@@ -220,7 +221,7 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         }
         poll(s);
     } else {
-        std::thread::Builder::new().name("filmcraft-scene-detect".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-scene-detect", run)?;
     }
     if let Some(Err(e)) = s.jobs.iter().find(|j| j.id == id).and_then(|j| lock(&j.result).clone()) {
         return Err(EngineError::Other(e));

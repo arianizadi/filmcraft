@@ -28,9 +28,9 @@ mod raster;
 pub mod settings;
 pub mod still;
 pub use audio_out::LoudnessReport;
-pub use job::{Exporter, Step, stepped};
+pub use job::{Exporter, Step, output_color_signal, stepped};
 pub use mxf_out::opatom_audio_paths;
-pub use pcm::{image_sequence_path, write_aiff, write_wav};
+pub use pcm::{PcmContainer, header as pcm_header, image_sequence_path, write_aiff, write_wav};
 pub use pipeline::limit_rgba8;
 pub use presets::{ExportPreset, builtin_presets};
 pub use settings::*;
@@ -101,7 +101,7 @@ pub type Result<T> = std::result::Result<T, ExportError>;
 pub struct Progress {
     pub done: AtomicU64,
     pub total: AtomicU64,
-    pub cancel: AtomicBool,
+    pub cancel: std::sync::Arc<AtomicBool>,
     pub finished: AtomicBool,
     pub status: Mutex<String>,
     pub error: Mutex<Option<String>>,

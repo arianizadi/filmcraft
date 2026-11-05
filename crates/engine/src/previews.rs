@@ -664,13 +664,8 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
     }
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("preview folder {}: {e}", dir.display())))?;
     let frames: i64 = todo.iter().map(|t| t.len).fold(0, i64::saturating_add);
-    let id = s.jobs.len() as u64 + 1;
-    let job = crate::Job {
-        id,
-        label: format!("Rendering {} preview segment{}", todo.len(), if todo.len() == 1 { "" } else { "s" }),
-        progress: Default::default(),
-        result: Default::default(),
-    };
+    let job = s.job_registry.new_job(s, format!("Rendering {} preview segment{}", todo.len(), if todo.len() == 1 { "" } else { "s" }))?;
+    let id = job.id;
     job.progress.total.store(frames.max(1) as u64, Ordering::Relaxed);
     let project = s.project.clone();
     // Previews are cached by content and reused with proxies on or off: always full resolution,
@@ -742,13 +737,13 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
         prog.finished.store(true, Ordering::Relaxed);
         *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
     if wait || cfg!(target_arch = "wasm32") {
         run();
     } else {
-        std::thread::Builder::new().name("filmcraft-render-previews".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-render-previews", run)?;
     }
     Ok(json!({"job": id, "segments": nseg, "frames": frames}))
 }
@@ -772,8 +767,8 @@ pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
     }
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("preview folder {}: {e}", dir.display())))?;
     let total: i64 = todo.iter().map(|g| g.samples).sum();
-    let id = s.jobs.len() as u64 + 1;
-    let job = crate::Job { id, label: "Rendering audio previews".into(), progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, "Rendering audio previews".into())?;
+    let id = job.id;
     job.progress.total.store(total.max(1) as u64, Ordering::Relaxed);
     let project = s.project.clone();
     let provider = s.media.full_res_provider(project.clone(), s.services.clone()).own_sources();
@@ -829,12 +824,12 @@ pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
         prog.finished.store(true, Ordering::Relaxed);
         *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     if p.get("wait").and_then(Value::as_bool).unwrap_or(false) || cfg!(target_arch = "wasm32") {
         run();
     } else {
-        std::thread::Builder::new().name("filmcraft-render-audio".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-render-audio", run)?;
     }
     Ok(json!({"job": id, "segments": nseg, "samples": total}))
 }

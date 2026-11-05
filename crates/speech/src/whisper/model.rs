@@ -28,6 +28,27 @@ pub struct Config {
     pub vocab_size: usize,
 }
 
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.num_mel_bins, 80 | 128)
+            || !(1..=1536).contains(&self.d_model)
+            || !(1..=32).contains(&self.encoder_layers)
+            || !(1..=32).contains(&self.decoder_layers)
+            || self.max_source_positions != 1500
+            || !(16..=2048).contains(&self.max_target_positions)
+            || !(1501..=100_000).contains(&self.vocab_size)
+        {
+            candle_core::bail!("config.json: unsupported or oversized Whisper architecture");
+        }
+        for heads in [self.encoder_attention_heads, self.decoder_attention_heads] {
+            if heads == 0 || heads > MAX_HEADS || !self.d_model.is_multiple_of(heads) {
+                candle_core::bail!("config.json: invalid attention head count");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Most attention heads a model may declare.
 const MAX_HEADS: usize = 64;
 
@@ -272,6 +293,7 @@ pub struct Model {
 
 impl Model {
     pub fn load(cfg: Config, weights: Vec<u8>) -> Result<Self> {
+        cfg.validate()?;
         let device = Device::Cpu;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)?;
         let vb = vb.pp("model");
@@ -280,7 +302,8 @@ impl Model {
 
     pub fn last_logits(logits: &Tensor) -> Result<Vec<f32>> {
         let t = logits.dim(1)?;
-        logits.get(0)?.get(t - 1)?.to_dtype(DType::F32)?.to_vec1()
+        let last = t.checked_sub(1).ok_or_else(|| candle_core::Error::Msg("empty decoder logits".into()))?;
+        logits.get(0)?.get(last)?.to_dtype(DType::F32)?.to_vec1()
     }
 }
 

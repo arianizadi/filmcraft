@@ -143,3 +143,9 @@ the full signal range in both file ranges), published reference points (S-Log3 9
 Log 18 % → 0.488, D-Log 0 → 0.0929), PQ/HLG reference white, EETF continuity/monotonicity and peak,
 hue preservation, gamut compression, BT.709/BT.2087 matrices, LUT interpolation and file round
 trips.
+
+ASC CDL interchange implements the v1.2-compatible forward/clamped SOP and saturation form,
+using the XML structure specified by the Academy CLF v3.0 `ASC_CDL` section:
+<https://docs.acescentral.com/clf/specification/#asc_cdl>. `cdl::parse_xml` reads `.cc`, `.ccc`
+and `.cdl` containers with bounded XML input and rejects DTDs and unsupported inverse/no-clamp styles.
+The host must declare the color encoding in which the corrections operate.

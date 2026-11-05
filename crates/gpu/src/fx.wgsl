@@ -55,6 +55,10 @@ const OP_BOKEH_BOOST: u32 = 33u;
 const OP_BOKEH: u32 = 34u;
 const OP_BOKEH_UP: u32 = 35u;
 const OP_THREE_WAY: u32 = 36u;
+const OP_LUMETRI_EXTRA:u32=37u;
+const OP_HSL_MASK:u32=38u;
+const OP_HSL_MEDIAN:u32=39u;
+const OP_HSL_COMBINE:u32=40u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -645,6 +649,58 @@ fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     return dec(v);
 }
 
+// The same 1024-entry tables sampled by effects::lumetri_advanced. The auxiliary texture
+// packs each scalar in Z, with 64 entries per row, exactly (no half-float quantization).
+fn grade_curve(table:u32,x:f32)->f32 {
+    let p=clamp(x,0.0,1.0)*1023.0;
+    let i=u32(p);let j=min(i+1u,1023u);
+    let a=table*1024u+i;let b=table*1024u+j;
+    let lo=textureLoad(aux,vec2<i32>(i32(a%64u),i32(a/64u)),0).z;
+    let hi=textureLoad(aux,vec2<i32>(i32(b%64u),i32(b/64u)),0).z;
+    return lo+(hi-lo)*(p-f32(i));
+}
+fn lumetri_extra(c:vec3<f32>)->vec3<f32>{
+    var v=enc(c);
+    let l=clamp(luma709(v),0.0,1.0);let sh=(1.0-l)*(1.0-l);let hi=l*l;let md=max(1.0-sh-hi,0.0);
+    v+=(u.p0.xyz*0.3+vec3(u.p0.w*0.3))*sh;
+    v+=(u.p1.xyz*0.3+vec3(u.p1.w*0.3))*md;
+    v*=vec3(1.0)+(u.p2.xyz*0.5+vec3(u.p2.w*0.5))*hi;
+    let bits=u.i1.x;
+    if (bits&1u)!=0u {v=vec3(grade_curve(0u,v.x),grade_curve(0u,v.y),grade_curve(0u,v.z));}
+    if (bits&2u)!=0u {v.x=grade_curve(1u,v.x);}
+    if (bits&4u)!=0u {v.y=grade_curve(2u,v.y);}
+    if (bits&8u)!=0u {v.z=grade_curve(3u,v.z);}
+    if (bits&496u)!=0u {
+        var h=rgb_to_hsl(v);let h0=h.x;let s0=h.y;let l0=h.z;
+        if (bits&32u)!=0u {h.x=fract_euclid(h.x+(grade_curve(5u,h0)-0.5));}
+        var sm=1.0;
+        if (bits&16u)!=0u {sm*=grade_curve(4u,h0)*2.0;}
+        if (bits&128u)!=0u {sm*=grade_curve(7u,l0)*2.0;}
+        if (bits&256u)!=0u {sm*=grade_curve(8u,s0)*2.0;}
+        h.y=clamp(h.y*sm,0.0,1.0);
+        if (bits&64u)!=0u {h.z=clamp(h.z+(grade_curve(6u,h0)-0.5)*0.5,0.0,1.0);}
+        v=hsl_to_rgb(h.x,h.y,h.z);
+    }
+    return dec(v);
+}
+fn hsl_key_mask(c:vec3<f32>)->f32{
+    let h=rgb_to_hsl(enc(c));let dh0=abs(h.x-u.p0.x);let dh=min(dh0,1.0-dh0);
+    let soft=u.p1.y;
+    let mh=1.0-clamp((dh-u.p0.y/2.0)/soft,0.0,1.0);
+    let ms=clamp((h.y-u.p0.z)/soft,0.0,1.0);
+    let ml=min(clamp((h.z-u.p0.w)/soft,0.0,1.0),clamp((u.p1.x-h.z)/soft,0.0,1.0));
+    return mh*ms*ml;
+}
+fn hsl_correct(c:vec3<f32>,m:f32)->vec3<f32>{
+    let v=enc(c);let mode=u.i1.x;
+    if mode==1u {let g=rgb_to_hsl(v).z;return dec(vec3(g)+(v-vec3(g))*m);}
+    if mode==2u {return dec(v*m);}
+    if mode==3u {return dec(vec3(m));}
+    var h=rgb_to_hsl(v);h.x=fract_euclid(h.x+u.p0.w);h.y=clamp(h.y*u.p0.z,0.0,1.0);
+    var c2=hsl_to_rgb(h.x,h.y,h.z);c2.x*=1.0+0.25*u.p0.x;c2.z*=1.0-0.25*u.p0.x;c2.y*=1.0-0.2*u.p0.y;
+    return dec(v+(c2-v)*m);
+}
+
 // One output pixel of every op but the running-sum box blur.
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
@@ -653,6 +709,19 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
         return bokeh(op, p);
     }
     switch op {
+        case OP_LUMETRI_EXTRA:{let o=ld(p);if o.a<=1e-6{return o;}return vec4(lumetri_extra(o.rgb/o.a)*o.a,o.a);}
+        case OP_HSL_MASK:{let o=ld(p);var c=vec3(0.0);if o.a>1e-6{c=o.rgb/o.a;}let m=hsl_key_mask(c);return vec4(m,m,m,1.0);}
+        case OP_HSL_MEDIAN:{
+            // CPU median_filter uses the clipped neighborhood at image borders, upper median.
+            var values:array<f32,49>;var count=0u;let r=i32(min(u.i1.x,3u));
+            for(var y=max(0,p.y-r);y<min(s.y,p.y+r+1);y++) {for(var x=max(0,p.x-r);x<min(s.x,p.x+r+1);x++) {
+                let value=ld(vec2(x,y)).x;var j=count;
+                loop {if j==0u{break;}if values[j-1u]<=value{break;}values[j]=values[j-1u];j--;}
+                values[j]=value;count++;
+            }}
+            let original=ld(p).x;let m=original+(values[count/2u]-original)*min(u.p0.x,1.0);return vec4(m,m,m,1.0);
+        }
+        case OP_HSL_COMBINE:{let o=textureLoad(aux,p,0);if o.a<=1e-6{return o;}return vec4(hsl_correct(o.rgb/o.a,ld(p).x)*o.a,o.a);}
         case OP_INVERT_ALPHA: {
             let o = ld(p);
             let a = o.a;

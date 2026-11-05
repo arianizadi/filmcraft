@@ -25,6 +25,7 @@ pub struct PlanStore {
     plans: BTreeMap<u64, EditPlan>,
 }
 
+#[derive(Clone)]
 struct Snapshots {
     before: Arc<Project>,
     after: Arc<Project>,
@@ -32,6 +33,7 @@ struct Snapshots {
     after_state: EditorState,
 }
 
+#[derive(Clone)]
 struct EditPlan {
     identity: Arc<()>,
     base_revision: u64,
@@ -48,6 +50,8 @@ struct Step {
     id: String,
     #[serde(default)]
     params: Value,
+    #[serde(default, rename = "dependsOn")]
+    dependencies: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -61,10 +65,15 @@ struct Request {
 }
 
 /// Whether a command may be evaluated as a staged in-memory edit. No prefix-based opt-in.
+pub fn belongs_to_document(s: &Session, id: u64) -> bool {
+    s.agent_plans.plans.get(&id).is_some_and(|p| Arc::ptr_eq(&p.identity, &s.project_instance))
+}
+
 pub fn eligible_command(id: &str) -> bool {
     matches!(
         id,
-        "file.newSequence"
+        "project.select"
+            | "file.newSequence"
             | "sequence.open"
             | "source.open"
             | "source.setPlayhead"
@@ -114,6 +123,9 @@ pub fn eligible_command(id: &str) -> bool {
             | "clip.scaleToFrameSize"
             | "clip.frameHold"
             | "clip.nest"
+            | "graphics.newText"
+            | "graphics.newShape"
+            | "graphics.set"
             | "effects.apply"
             | "effects.remove"
             | "effects.setParam"
@@ -128,6 +140,20 @@ pub fn eligible_command(id: &str) -> bool {
             | "grade.copy"
             | "grade.reset"
             | "grade.matchBatch"
+            | "gallery.save"
+            | "gallery.delete"
+            | "gallery.applyGrade"
+            | "grade.version.save"
+            | "grade.version.apply"
+            | "grade.version.delete"
+            | "grade.look.save"
+            | "grade.look.update"
+            | "grade.look.link"
+            | "grade.look.unlink"
+            | "grade.look.delete"
+            | "grade.cdl.import"
+            | "subject.installAlpha"
+            | "subject.installReframe"
             | "lumetri.applyMatch"
             | "lumetri.applyPreset"
             | "lumetri.setSection"
@@ -152,6 +178,19 @@ pub fn eligible_command(id: &str) -> bool {
             | "transcript.lift"
             | "transcript.removePauses"
             | "transcript.removeFillers"
+            | "transcript.cutRange"
+            | "captions.translate"
+            | "transcript.set"
+            | "review.checkpoint"
+            | "review.deleteCheckpoint"
+            | "workflow.importSources"
+            | "workflow.normalizeAudio"
+            | "essentialSound.setType"
+            | "essentialSound.autoMatch"
+            | "profile.save"
+            | "transcript.patchWords"
+            | "review.annotate"
+            | "profile.apply"
             | "transcript.createCaptions"
             | "markers.add"
             | "markers.addRange"
@@ -383,6 +422,28 @@ fn caption_changes(old_seq: Option<&Sequence>, new_seq: Option<&Sequence>) -> Re
     Ok(CaptionChanges { tracks, captions, track_ids: affected_tracks, caption_ids: affected_captions, count: changes })
 }
 
+fn changed_project_fields(before: &Project, after: &Project) -> Vec<&'static str> {
+    let mut project_fields = Vec::new();
+    macro_rules! field { ($($f:ident),*)=>{$(if before.$f != after.$f {project_fields.push(stringify!($f));})*}; }
+    field!(
+        name,
+        color_workflow,
+        custom_colors,
+        custom_color_names,
+        settings,
+        root,
+        luts,
+        transcripts,
+        transcript_word_counters,
+        search_bins,
+        source_graphics,
+        narrations,
+        notes,
+        review
+    );
+    project_fields
+}
+
 /// Complete typed project changes for review and operation receipts. Oversized reports fail closed.
 pub fn project_diff(before: &Project, after: &Project) -> Result<Value> {
     let (mut items, mut sequences, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
@@ -420,7 +481,7 @@ pub fn project_diff(before: &Project, after: &Project) -> Result<Value> {
                 affected_tracks.insert(t.0);
             }
             let moved = matches!((a,b),(Some((ta,ca)),Some((tb,cb))) if ta != tb || ca.start != cb.start);
-            let grade_changed = matches!((a,b),(Some((_,ca)),Some((_,cb))) if ca.effects != cb.effects);
+            let grade_changed = matches!((a,b),(Some((_,ca)),Some((_,cb))) if !filmcraft_project::effect::same_content(&ca.effects, &cb.effects));
             clips.push(json!({"clip":clip,"change":kind(a.is_some(),b.is_some()),"moved":moved,"gradeChanged":grade_changed,
                 "beforeTrack":a.map(|x|x.0.0),"afterTrack":b.map(|x|x.0.0),"before":serialize(&a.map(|x|x.1))?,"after":serialize(&b.map(|x|x.1))?}));
             if let Some(link) = a.and_then(|(_, c)| c.link).or_else(|| b.and_then(|(_, c)| c.link)) {
@@ -465,9 +526,7 @@ pub fn project_diff(before: &Project, after: &Project) -> Result<Value> {
         sequences.push(json!({"sequence":id.0,"clips":clips,"tracks":tracks,"captions":captions,"transitions":transitions,
             "settingsChanged":old_seq.map(|q|&q.settings)!=new_seq.map(|q|&q.settings),"markersChanged":old_seq.map(|q|&q.markers)!=new_seq.map(|q|&q.markers)}));
     }
-    let mut project_fields = Vec::new();
-    macro_rules! field { ($($f:ident),*)=>{$(if before.$f != after.$f {project_fields.push(stringify!($f));})*}; }
-    field!(name, custom_colors, custom_color_names, settings, root, luts, transcripts, search_bins, source_graphics, narrations, notes);
+    let project_fields = changed_project_fields(before, after);
     let report = json!({"items":items,"sequences":sequences,"projectFields":project_fields,"warnings":warnings,"affected":{
         "items":affected_items,"sequences":affected_sequences,"clips":affected_clips,"tracks":affected_tracks,"captions":affected_captions,"transitions":affected_transitions}});
     bounded_json(&report, MAX_REPORT_BYTES)?;
@@ -487,7 +546,13 @@ fn plan(s: &mut Session, p: &Value) -> Result<Value> {
     if label.trim().is_empty() || label.len() > 256 {
         return Err(bad("agent.plan", "label must contain 1 to 256 bytes"));
     }
-    for step in &request.steps {
+    for (index, step) in request.steps.iter().enumerate() {
+        if step.dependencies.len() > MAX_STEPS
+            || step.dependencies.iter().any(|dep| *dep >= index)
+            || step.dependencies.iter().copied().collect::<BTreeSet<_>>().len() != step.dependencies.len()
+        {
+            return Err(bad("agent.plan", "dependsOn must contain unique earlier step indices"));
+        }
         if !step.params.is_null() && !step.params.is_object() {
             return Err(bad("agent.plan", "step params must be an object"));
         }
@@ -513,10 +578,12 @@ fn plan(s: &mut Session, p: &Value) -> Result<Value> {
     sandbox.state = s.state.clone();
     sandbox.revision = s.revision;
     sandbox.saved_revision = s.saved_revision;
+    sandbox.effect_identity_floor = s.effect_identity_floor;
     sandbox.document_epoch = s.document_epoch;
     sandbox.media = s.media.clone();
     sandbox.prefs = s.prefs.clone();
     sandbox.prefs.media_analysis.auto_transcribe = false;
+    sandbox.record_review_activity = false;
     let mut results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
         let mut params = resolve(&step.params, &results, 0)?;
@@ -526,8 +593,27 @@ fn plan(s: &mut Session, p: &Value) -> Result<Value> {
         if !params.is_object() {
             return Err(bad("agent.plan", format!("step {index} params must resolve to an object")));
         }
-        if matches!(step.id.as_str(), "grade.patch" | "grade.copy" | "grade.reset" | "grade.matchBatch")
-            && let Some(o) = params.as_object_mut()
+        if matches!(
+            step.id.as_str(),
+            "grade.patch"
+                | "grade.copy"
+                | "grade.reset"
+                | "grade.matchBatch"
+                | "gallery.save"
+                | "gallery.delete"
+                | "gallery.applyGrade"
+                | "grade.version.save"
+                | "grade.version.apply"
+                | "grade.version.delete"
+                | "grade.look.save"
+                | "grade.look.update"
+                | "grade.look.link"
+                | "grade.look.unlink"
+                | "grade.look.delete"
+                | "grade.cdl.import"
+                | "subject.installAlpha"
+                | "subject.installReframe"
+        ) && let Some(o) = params.as_object_mut()
         {
             o.entry("expectedRevision").or_insert(json!(sandbox.revision));
         }
@@ -538,8 +624,11 @@ fn plan(s: &mut Session, p: &Value) -> Result<Value> {
         }
         results.push(value);
     }
+    if *s.project != *sandbox.project {
+        crate::review::record(Arc::make_mut(&mut sandbox.project), "agent.apply", &label, s.revision, s.revision.saturating_add(1))?;
+    }
     let diff = project_diff(&s.project, &sandbox.project)?;
-    let commands: Vec<Value> = request.steps.iter().map(|step| json!({"id":step.id,"params":step.params})).collect();
+    let commands: Vec<Value> = request.steps.iter().map(|step| json!({"id":step.id,"params":step.params,"dependsOn":step.dependencies})).collect();
     let report = json!({"plan":id,"label":label,"baseRevision":s.revision,"status":"staged","steps":results,"commands":commands,"diff":diff,"noChange":*s.project==*sandbox.project});
     bounded_json(&report, MAX_REPORT_BYTES)?;
     let entry = EditPlan {
@@ -553,6 +642,87 @@ fn plan(s: &mut Session, p: &Value) -> Result<Value> {
     };
     s.agent_plans.next_id = id;
     s.agent_plans.plans.insert(id, entry);
+    Ok(report)
+}
+
+/// Regenerate a subset; omitted dependencies are rejected rather than silently adding edits.
+fn subset(s: &mut Session, p: &Value) -> Result<Value> {
+    bounded_json(p, MAX_REQUEST_BYTES)?;
+    let id = plan_id(p, "agent.subset")?;
+    let original = s.agent_plans.plans.get(&id).ok_or_else(|| bad("agent.subset", "unknown plan"))?;
+    if original.discarded
+        || original.applied.is_some()
+        || original.base_revision != s.revision
+        || !Arc::ptr_eq(&original.identity, &s.project_instance)
+        || original.snapshots.as_ref().is_none_or(|x| *x.before != *s.project)
+    {
+        return Err(bad("agent.subset", "stale or completed plan; inspect and propose again"));
+    }
+    let indices = p["steps"]
+        .as_array()
+        .filter(|a| !a.is_empty() && a.len() <= MAX_STEPS)
+        .ok_or_else(|| bad("agent.subset", "steps must contain 1–256 original step indices"))?;
+    let commands = original.report["commands"].as_array().ok_or_else(|| bad("agent.subset", "plan commands unavailable"))?;
+    let mut selected = BTreeSet::new();
+    for index in indices {
+        let index = index
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|i| *i < commands.len())
+            .ok_or_else(|| bad("agent.subset", "step index out of range"))?;
+        if !selected.insert(index) {
+            return Err(bad("agent.subset", "duplicate selected step"));
+        }
+    }
+    let mapping: BTreeMap<usize, usize> = selected.iter().enumerate().map(|(new, old)| (*old, new)).collect();
+    fn remap(v: &mut Value, mapping: &BTreeMap<usize, usize>, depth: usize) -> Result<()> {
+        if depth > 32 {
+            return Err(bad("agent.subset", "step reference nesting limit"));
+        }
+        match v {
+            Value::Object(o) => {
+                if let Some(old) = o.get("$step") {
+                    let old = old.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad("agent.subset", "invalid step reference"))?;
+                    let new = mapping.get(&old).ok_or_else(|| bad("agent.subset", format!("selected step depends on omitted step {old}")))?;
+                    o.insert("$step".into(), json!(new));
+                } else {
+                    for child in o.values_mut() {
+                        remap(child, mapping, depth + 1)?
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for child in a {
+                    remap(child, mapping, depth + 1)?
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut steps = Vec::with_capacity(selected.len());
+    for i in &selected {
+        let mut command = commands.get(*i).cloned().ok_or_else(|| bad("agent.subset", "step missing"))?;
+        if let Some(dependencies) = command.get("dependsOn").and_then(Value::as_array) {
+            let mut mapped = Vec::new();
+            for old in dependencies {
+                let old = old.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad("agent.subset", "invalid step dependency"))?;
+                mapped.push(*mapping.get(&old).ok_or_else(|| bad("agent.subset", format!("selected step requires omitted setup step {old}")))?);
+            }
+            command["dependsOn"] = json!(mapped);
+        }
+        remap(&mut command, &mapping, 0)?;
+        steps.push(command)
+    }
+    let label = format!("{} (selected steps)", original.label.chars().take(220).collect::<String>());
+    let mut report = plan(s, &json!({"label":label,"baseRevision":s.revision,"steps":steps}))?;
+    if let Some(object) = report.as_object_mut() {
+        object.insert("parentPlan".into(), json!(id));
+        object.insert("selectedSteps".into(), json!(selected));
+    }
+    if let Some(new) = report["plan"].as_u64().and_then(|id| s.agent_plans.plans.get_mut(&id)) {
+        new.report = report.clone()
+    }
     Ok(report)
 }
 
@@ -573,6 +743,9 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     });
     report["stale"] = json!(plan.base_revision != s.revision || !Arc::ptr_eq(&plan.identity, &s.project_instance));
     report["currentRevision"] = json!(s.revision);
+    if report.get("workflow").is_some() {
+        report["workflow"]["approvalRequired"] = json!(plan.applied.is_none() && !plan.discarded);
+    }
     Ok(report)
 }
 
@@ -599,24 +772,32 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         // One edit, rather than replaying commands: approved pixels/IDs are exactly what lands.
         // Preserve live navigation when the user changed it during review. Staged seeks only
         // drive the proposal; a newly created/opened sequence can become visible on approval.
-        s.edit(&label, move |p, state| {
-            *p = (*after).clone();
-            if state.active_sequence == before_state.active_sequence && before_state.active_sequence != after_state.active_sequence {
-                state.active_sequence = after_state.active_sequence;
-                if let Some(id) = after_state.active_sequence
-                    && !state.open_sequences.contains(&id)
-                {
-                    state.open_sequences.push(id);
+        let record_activity = std::mem::replace(&mut s.record_review_activity, false);
+        let edited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.edit(&label, move |p, state| {
+                *p = (*after).clone();
+                if state.active_sequence == before_state.active_sequence && before_state.active_sequence != after_state.active_sequence {
+                    state.active_sequence = after_state.active_sequence;
+                    if let Some(id) = after_state.active_sequence
+                        && !state.open_sequences.contains(&id)
+                    {
+                        state.open_sequences.push(id);
+                    }
                 }
-            }
-            if state.selection == before_state.selection {
-                state.selection = after_state.selection;
-            }
-            if state.caption_selection == before_state.caption_selection {
-                state.caption_selection = after_state.caption_selection;
-            }
-            Ok(())
-        })?;
+                if state.selection == before_state.selection {
+                    state.selection = after_state.selection;
+                }
+                if state.caption_selection == before_state.caption_selection {
+                    state.caption_selection = after_state.caption_selection;
+                }
+                Ok(())
+            })
+        }));
+        s.record_review_activity = record_activity;
+        match edited {
+            Ok(result) => result?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         s.state.selection.retain(|c| s.state.active_sequence.and_then(|q| s.project.sequence(q)).is_some_and(|q| q.find_item(*c).is_some()));
     }
     let receipt = json!({"plan":id,"status":"applied","beforeRevision":before_revision,"afterRevision":s.revision,"affected":affected,"changed":changed,"undoSteps":u8::from(changed)});
@@ -637,7 +818,53 @@ fn discard(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"plan":id,"status":"discarded"}))
 }
 
+/// A validated immutable proposal transported from a background reader to the native session.
+/// Construction is private: network clients cannot submit arbitrary replacement projects.
+pub struct PreparedEditPlan(EditPlan);
+
 impl Session {
+    pub(crate) fn agent_annotate_plan(&mut self, id: u64, fields: &Value) -> Result<Value> {
+        let plan = self.agent_plans.plans.get_mut(&id).ok_or_else(|| bad("agent.plan", "plan missing"))?;
+        let mut report = plan.report.clone();
+        let fields = fields.as_object().ok_or_else(|| bad("agent.plan", "metadata must be an object"))?;
+        for (key, value) in fields {
+            if !["workflow", "preparation", "resolvedProfile", "profileWarnings", "ranges"].contains(&key.as_str()) {
+                return Err(bad("agent.plan", "reserved plan metadata key"));
+            }
+            report[key] = value.clone();
+        }
+        bounded_json(&report, MAX_REPORT_BYTES)?;
+        plan.report = report.clone();
+        Ok(report)
+    }
+    pub fn agent_export_prepared_plan(&self, id: u64) -> Result<PreparedEditPlan> {
+        let plan =
+            self.agent_plans.plans.get(&id).filter(|p| !p.discarded && p.applied.is_none()).ok_or_else(|| bad("agent.plan", "staged plan is missing"))?;
+        Ok(PreparedEditPlan(plan.clone()))
+    }
+    pub fn agent_adopt_prepared_plan(&mut self, prepared: PreparedEditPlan) -> Result<Value> {
+        let mut plan = prepared.0;
+        if plan.base_revision != self.revision
+            || !Arc::ptr_eq(&plan.identity, &self.project_instance)
+            || plan.snapshots.as_ref().is_none_or(|p| *p.before != *self.project)
+        {
+            return Err(bad("agent.plan", "stale_plan: project changed while preparing; prepare again against the current edit"));
+        }
+        if self.agent_plans.plans.len() >= MAX_PLANS {
+            if let Some(id) = self.agent_plans.plans.iter().find(|(_, p)| p.discarded || p.applied.is_some()).map(|(id, _)| *id) {
+                self.agent_plans.plans.remove(&id);
+            } else {
+                return Err(bad("agent.plan", "too many staged plans; apply or discard one"));
+            }
+        }
+        let id = self.agent_plans.next_id.checked_add(1).ok_or_else(|| bad("agent.plan", "plan IDs exhausted"))?;
+        plan.report["plan"] = json!(id);
+        let report = plan.report.clone();
+        self.agent_plans.plans.insert(id, plan);
+        self.agent_plans.next_id = id;
+        Ok(report)
+    }
+
     /// Frozen before/after snapshots for exact staged renders, even if the live plan is now stale.
     pub fn agent_plan_snapshot(&self, plan_id: u64, before: bool) -> Result<(Arc<Project>, EditorState, u64)> {
         let plan = self.agent_plans.plans.get(&plan_id).ok_or_else(|| bad("agent.preview", "unknown plan"))?;
@@ -656,7 +883,14 @@ impl Session {
 pub fn commands() -> Vec<CommandSpec> {
     let spec = |id, label, params, run, journal| CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: always, run, journal };
     vec![
-        spec("agent.plan", "Propose Edit Plan", r#"{"label":str?,"baseRevision":u64?,"steps":[{"id":str,"params":object?}]}"#, plan, false),
+        spec(
+            "agent.plan",
+            "Propose Edit Plan",
+            r#"{"label":str?,"baseRevision":u64?,"steps":[{"id":str,"params":object?,"dependsOn":[index]?}]}"#,
+            plan,
+            false,
+        ),
+        spec("agent.subset", "Review Selected Plan Steps", r#"{"plan":id,"steps":[index]}"#, subset, false),
         spec("agent.preview", "Preview Edit Plan", r#"{"plan":id}"#, preview, false),
         spec("agent.apply", "Apply Edit Plan", r#"{"plan":id}"#, apply, true),
         spec("agent.discard", "Discard Edit Plan", r#"{"plan":id}"#, discard, false),

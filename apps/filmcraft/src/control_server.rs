@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
+use filmcraft_engine::pairing::Pairings;
 use filmcraft_ui_egui::ControlRequest;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -64,11 +65,16 @@ impl DisabledWhy {
 /// Start the server for `--control`. Returns the request queue, a flag the app sets once it can
 /// answer requests (until then they are rejected with a retryable error), and — when the server
 /// is *not* running — why (#3436), for the log and (for a bad token) the status bar.
-pub fn start(port: u16, ctx: egui::Context) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
-    start_with_token(port, ctx, std::env::var("FILMCRAFT_CONTROL_TOKEN").ok())
+pub fn start(port: u16, ctx: egui::Context, pairings: Pairings) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
+    start_with_pairings(port, ctx, std::env::var("FILMCRAFT_CONTROL_TOKEN").ok(), pairings)
 }
 
-fn start_with_token(port: u16, ctx: egui::Context, token: Option<String>) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
+fn start_with_pairings(
+    port: u16,
+    ctx: egui::Context,
+    token: Option<String>,
+    pairings: Pairings,
+) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
     let (tx, rx) = channel::<ControlRequest>();
     // An inherited environment variable shares the credential with the owner's bridge process
     // without exposing it in command-line arguments, logs, or a shared discovery file.
@@ -86,7 +92,7 @@ fn start_with_token(port: u16, ctx: egui::Context, token: Option<String>) -> (Re
             // client retry would then apply the same mutation twice (#3436).
             let ready = Arc::new(AtomicBool::new(false));
             let loop_ready = Arc::clone(&ready);
-            std::thread::spawn(move || accept_loop(listener, tx, ctx, token, loop_ready));
+            std::thread::spawn(move || accept_loop_paired(listener, tx, ctx, token, loop_ready, pairings));
             (rx, ready, None)
         }
         Err(error) => {
@@ -97,7 +103,7 @@ fn start_with_token(port: u16, ctx: egui::Context, token: Option<String>) -> (Re
     }
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: String, ready: Arc<AtomicBool>) {
+fn accept_loop_paired(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: String, ready: Arc<AtomicBool>, pairings: Pairings) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -109,12 +115,13 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         let ctx = ctx.clone();
         let token = token.clone();
         let ready = Arc::clone(&ready);
+        let pairings = pairings.clone();
         // The slot is given back when the guard drops: after `serve` returns, if it panics, or if
         // the thread can't be started (the closure, and with it the guard, is dropped).
         let slot = Slot(Arc::clone(&open));
         let spawned = std::thread::Builder::new().name("control-conn".into()).spawn(move || {
             let _slot = slot;
-            serve(stream, &tx, &ctx, &token, ready);
+            serve_paired(stream, &tx, &ctx, &token, ready, pairings);
         });
         if let Err(e) = spawned {
             log::warn!("control server could not start a connection thread: {e}");
@@ -131,30 +138,32 @@ impl Drop for Slot {
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: &str, ready: Arc<AtomicBool>) {
-    if let Err(e) = serve_with_timeout(stream, tx, ctx, token, CONNECTION_TIMEOUT, ready) {
+fn serve_paired(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: &str, ready: Arc<AtomicBool>, pairings: Pairings) {
+    if let Err(e) = serve_with_timeout_paired(stream, tx, ctx, token, CONNECTION_TIMEOUT, ready, pairings) {
         log::warn!("could not configure control connection: {e}");
     }
 }
 
-fn serve_with_timeout(
+fn serve_with_timeout_paired(
     stream: TcpStream,
     tx: &Sender<ControlRequest>,
     ctx: &egui::Context,
     token: &str,
     timeout: Duration,
     ready: Arc<AtomicBool>,
+    pairings: Pairings,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let read = stream.try_clone()?;
-    serve_lines(read, stream, token, |method, params| {
+    serve_lines_paired(read, stream, token, &pairings, |method, params, client| {
         // Until the app can drain the queue, a request would outlive its 60 s reply wait and
         // still run after startup: reject it instead, so a client retry is the only copy (#3436).
         if !ready.load(Ordering::Relaxed) {
             return Some(json!({"ok": false, "error": "FilmCraft is still starting; send the request again"}));
         }
-        let (req, rrx) = ControlRequest::new(method, params);
+        let (mut req, rrx) = ControlRequest::new(method, params);
+        req.client = client;
         tx.send(req).ok()?;
         ctx.request_repaint();
         Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
@@ -168,6 +177,7 @@ enum Line {
         id: Value,
         method: String,
         params: Value,
+        client: Option<String>,
     },
     Blank,
     /// Not a request: reply with this error and close the connection.
@@ -198,7 +208,12 @@ fn parse_line(bytes: &[u8], token: &str) -> Line {
     if !authenticated {
         return Line::Reject("control authentication failed; closing the connection".into());
     }
-    Line::Request { id: obj.get("id").cloned().unwrap_or(Value::Null), method: method.to_string(), params: obj.get("params").cloned().unwrap_or(json!({})) }
+    Line::Request {
+        id: obj.get("id").cloned().unwrap_or(Value::Null),
+        method: method.to_string(),
+        params: obj.get("params").cloned().unwrap_or(json!({})),
+        client: None,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -237,7 +252,13 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+fn serve_lines_paired<R: Read, W: Write>(
+    read: R,
+    mut out: W,
+    token: &str,
+    pairings: &Pairings,
+    mut handle: impl FnMut(String, Value, Option<String>) -> Option<Value>,
+) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
@@ -247,11 +268,11 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: 
             // than read a stale error reply. A partial line must not be parsed on timeout.
             Err(ReadFailure::Timeout) => return,
             Err(ReadFailure::Rejected(e)) => e,
-            Ok(true) => match parse_line(&buf, token) {
+            Ok(true) => match parse_line_paired(&buf, token, pairings) {
                 Line::Blank => continue,
                 Line::Reject(e) => e,
-                Line::Request { id, method, params } => {
-                    let Some(mut r) = handle(method, params) else { return };
+                Line::Request { id, method, params, client } => {
+                    let Some(mut r) = handle(method, params, client) else { return };
                     if let Some(o) = r.as_object_mut() {
                         o.insert("id".into(), id);
                     }
@@ -265,6 +286,49 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: 
         let _ = writeln!(out, "{}", json!({"ok": false, "error": reject})).and_then(|()| out.flush());
         return;
     }
+}
+
+fn parse_line_paired(bytes: &[u8], token: &str, pairings: &Pairings) -> Line {
+    let original = parse_line(bytes, token);
+    if !matches!(&original, Line::Reject(e) if e.starts_with("control authentication failed")) {
+        return original;
+    }
+    let Ok(mut message) = serde_json::from_slice::<Value>(bytes) else { return original };
+    let Some(client) = message.get("token").and_then(Value::as_str).and_then(|s| pairings.authenticate(s)) else { return original };
+    message["token"] = json!(token);
+    let Ok(bytes) = serde_json::to_vec(&message) else { return original };
+    match parse_line(&bytes, token) {
+        Line::Request { id, method, params, .. } => Line::Request { id, method, params, client: Some(client) },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+fn start_with_token(port: u16, ctx: egui::Context, token: Option<String>) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
+    start_with_pairings(port, ctx, token, Pairings::default())
+}
+#[cfg(test)]
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: String, ready: Arc<AtomicBool>) {
+    accept_loop_paired(listener, tx, ctx, token, ready, Pairings::default());
+}
+#[cfg(test)]
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: &str, ready: Arc<AtomicBool>) {
+    serve_paired(stream, tx, ctx, token, ready, Pairings::default());
+}
+#[cfg(test)]
+fn serve_with_timeout(
+    stream: TcpStream,
+    tx: &Sender<ControlRequest>,
+    ctx: &egui::Context,
+    token: &str,
+    timeout: Duration,
+    ready: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    serve_with_timeout_paired(stream, tx, ctx, token, timeout, ready, Pairings::default())
+}
+#[cfg(test)]
+fn serve_lines<R: Read, W: Write>(read: R, out: W, token: &str, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+    serve_lines_paired(read, out, token, &Pairings::default(), |m, p, _| handle(m, p));
 }
 
 #[cfg(test)]

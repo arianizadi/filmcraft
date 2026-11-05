@@ -102,7 +102,7 @@ fn compare(cpu: &[f32], gpu: &[f32]) -> (f32, f64) {
 
 /// Effect cases: (effect id, parameters, whether a threshold may flip pixels).
 fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
-    vec![
+    let mut cases = vec![
         ("brightness_contrast", vec![("brightness", fl(30.0)), ("contrast", fl(40.0))], false),
         ("brightness_contrast", vec![("brightness", fl(-100.0)), ("contrast", fl(-100.0))], false),
         ("brightness_contrast", vec![("brightness", fl(100.0)), ("contrast", fl(100.0))], false),
@@ -348,7 +348,45 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
             ],
             false,
         ),
-    ]
+    ];
+    for id in ["curve_luma", "curve_red", "curve_green", "curve_blue", "hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"] {
+        cases.push(("lumetri", vec![(id, ParamValue::Curve(vec![[0.0, 0.2], [0.22, 0.52], [0.73, 0.61], [1.0, 0.85]]))], false));
+    }
+    cases.push((
+        "lumetri",
+        vec![
+            ("wheel_shadows", pt(0.2, -0.1)),
+            ("wheel_midtones", pt(-0.3, 0.1)),
+            ("wheel_highlights", pt(0.12, 0.25)),
+            ("wheel_shadows_l", fl(12.0)),
+            ("wheel_midtones_l", fl(-8.0)),
+            ("wheel_highlights_l", fl(10.0)),
+        ],
+        false,
+    ));
+    for mode in 0..=3 {
+        for (denoise, blur) in [(0.0, 0.0), (40.0, 0.0), (100.0, 20.0), (100.0, 100.0)] {
+            cases.push((
+                "lumetri",
+                vec![
+                    ("hsl_on", ParamValue::Bool(true)),
+                    ("hsl_hue", fl(160.0)),
+                    ("hsl_hue_range", fl(160.0)),
+                    ("hsl_sat_min", fl(10.0)),
+                    ("hsl_soft", fl(70.0)),
+                    ("hsl_temp", fl(20.0)),
+                    ("hsl_tint", fl(-30.0)),
+                    ("hsl_sat", fl(130.0)),
+                    ("hsl_hue_shift", fl(22.0)),
+                    ("hsl_show_mask", ch(mode)),
+                    ("hsl_denoise", fl(denoise)),
+                    ("hsl_blur", fl(blur)),
+                ],
+                false,
+            ));
+        }
+    }
+    cases
 }
 
 /// Every effect case on the GPU against its CPU reference, on the working image read back as f32.
@@ -653,27 +691,27 @@ fn lumetri_unsupported_sections_fall_back() {
     // curve_luma modified
     let e = effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // hue_vs_sat non-empty
     let e = effect("lumetri", &[("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // wheel offset
     let e = effect("lumetri", &[("wheel_shadows", pt(0.5, 0.0))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // wheel lightness
     let e = effect("lumetri", &[("wheel_midtones_l", fl(20.0))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // HSL secondary on
     let e = effect("lumetri", &[("hsl_on", ParamValue::Bool(true))]);
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    assert!(op.as_ref().is_some_and(|o| o.gpu_ok()));
 
     // HDR working space
     let e = effect("lumetri", &[]);

@@ -305,6 +305,10 @@ fn prints_time(it: &TrackItem) -> bool {
 fn hash_item(h: &mut Fnv128, project: &Project, it: &TrackItem, origin: Tick, kind: TrackKind, depth: u32) {
     let mut c = it.clone();
     c.id = Default::default();
+    // Placed identity cannot change pixels or invalidate a cached render.
+    for effect in &mut c.effects {
+        effect.instance_id = 0;
+    }
     c.start -= origin;
     c.label = filmcraft_project::Label::ALL[0];
     c.markers.clear();
@@ -314,6 +318,9 @@ fn hash_item(h: &mut Fnv128, project: &Project, it: &TrackItem, origin: Tick, ki
         c.name.clear();
     }
     h.json(&c);
+    if kind == TrackKind::Video {
+        h.json(project.color_workflow.shared_effects(it));
+    }
     hash_source(h, project, it.item, kind, depth);
 }
 
@@ -490,7 +497,9 @@ fn item_fx_cost(it: &TrackItem, px: f64) -> f64 {
 }
 
 fn cpu_layer(project: &Project, it: &TrackItem) -> bool {
-    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
+    let fx = project.color_workflow.has_shared_effects(it)
+        || it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
+        || it.has_opacity_masks();
     let blend = crate::opacity_blend(it, it.source_in).1 != crate::Blend::Normal;
     let nested = project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Sequence(_)));
     fx || blend || nested
@@ -524,7 +533,7 @@ fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer]) -> f64 {
 /// A single clip that plays natively: no standard effects, untouched fixed effects, normal speed,
 /// source frame size and rate equal to the sequence's.
 fn native(project: &Project, seq: &Sequence, it: &TrackItem) -> bool {
-    if it.has_standard_effects() || it.has_modified_intrinsics() || (it.speed - 1.0).abs() > 1e-9 || it.reverse || it.frame_hold.is_some() {
+    if crate::has_standard_effects(project, it) || it.has_modified_intrinsics() || (it.speed - 1.0).abs() > 1e-9 || it.reverse || it.frame_hold.is_some() {
         return false;
     }
     match project.item(it.item).map(|p| &p.kind) {

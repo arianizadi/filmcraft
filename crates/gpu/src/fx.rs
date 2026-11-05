@@ -57,6 +57,10 @@ const OP_BOKEH_BOOST: u32 = 33;
 const OP_BOKEH: u32 = 34;
 const OP_BOKEH_UP: u32 = 35;
 const OP_THREE_WAY: u32 = 36;
+const OP_LUMETRI_EXTRA: u32 = 37;
+const OP_HSL_MASK: u32 = 38;
+const OP_HSL_MEDIAN: u32 = 39;
+const OP_HSL_COMBINE: u32 = 40;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -278,6 +282,7 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             vround,
             vfeather,
             aspect,
+            extra,
             ..
         } => {
             let ge = [gains[0] * exposure, gains[1] * exposure, gains[2] * exposure];
@@ -316,6 +321,44 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 0.0,
             ];
             out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
+            if let Some(extra) = extra {
+                let bits = extra.curves.iter().enumerate().fold(0u32, |bits, (i, c)| bits | if c.is_empty() { 0 } else { 1 << i });
+                if bits != 0 || extra.wheels.iter().flatten().chain(&extra.lightness).any(|v| v.abs() > 1e-5) {
+                    let mut params = Vec::new();
+                    for (wheel, l) in extra.wheels.iter().zip(extra.lightness) {
+                        params.extend_from_slice(wheel);
+                        params.push(l);
+                    }
+                    let mut advanced = step(OP_LUMETRI_EXTRA, [bits, 0, 0, 0], &params);
+                    if bits != 0 {
+                        for curve in &extra.curves {
+                            for i in 0..filmcraft_render::lumetri_extra::CURVE_SAMPLES {
+                                advanced.kernel.push((0, 0, curve.get(i).copied().unwrap_or(0.0)));
+                            }
+                        }
+                    }
+                    out.push(advanced);
+                }
+                if let Some(hsl) = &extra.hsl {
+                    let mut mask = step(OP_HSL_MASK, [0; 4], &hsl.key);
+                    mask.unsharp_blur = true;
+                    out.push(mask);
+                    if hsl.denoise > 0.0 {
+                        let mut median = step(OP_HSL_MEDIAN, [hsl.median_radius, 0, 0, 0], &[hsl.denoise]);
+                        median.unsharp_blur = true;
+                        out.push(median);
+                    }
+                    let before = out.len();
+                    boxes(&hsl.blur_x, false, true, &mut out);
+                    boxes(&hsl.blur_y, true, true, &mut out);
+                    for blur in out.iter_mut().skip(before) {
+                        blur.unsharp_blur = true;
+                    }
+                    let mut combine = step(OP_HSL_COMBINE, [hsl.show, 0, 0, 0], &hsl.correction);
+                    combine.combine = true;
+                    out.push(combine);
+                }
+            }
         }
     }
     out

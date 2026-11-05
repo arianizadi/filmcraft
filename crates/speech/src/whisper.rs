@@ -65,20 +65,39 @@ impl Whisper {
     /// Load a model directory (`config.json`, `generation_config.json`, `tokenizer.json`,
     /// `model.safetensors`).
     pub fn load(dir: &Path, id: &str) -> Result<Self, SpeechError> {
-        let read = |n: &str| std::fs::read(dir.join(n)).map_err(|e| SpeechError::Model(format!("{}: {e}", dir.join(n).display())));
-        let cfg: Config = serde_json::from_slice(&read("config.json")?).map_err(|e| SpeechError::Model(format!("config.json: {e}")))?;
-        let gen_cfg: serde_json::Value = serde_json::from_slice(&read("generation_config.json")?).unwrap_or_default();
-        let tok = Tokenizer::from_json(&String::from_utf8_lossy(&read("tokenizer.json")?))?;
-        let weights = read("model.safetensors")?;
+        let read = |name: &str, limit: u64| -> Result<Vec<u8>, SpeechError> {
+            use std::io::Read;
+            let path = dir.join(name);
+            let file = std::fs::File::open(&path).map_err(|e| SpeechError::Model(format!("{}: {e}", path.display())))?;
+            let size = file.metadata().map_err(|e| SpeechError::Model(e.to_string()))?.len();
+            if size > limit {
+                return Err(SpeechError::Model(format!("{name}: file exceeds {limit} byte limit")));
+            }
+            let mut bytes = Vec::new();
+            file.take(limit + 1).read_to_end(&mut bytes).map_err(|e| SpeechError::Model(e.to_string()))?;
+            if bytes.len() as u64 > limit {
+                return Err(SpeechError::Model(format!("{name}: file grew beyond its limit")));
+            }
+            Ok(bytes)
+        };
+        let cfg: Config = serde_json::from_slice(&read("config.json", 1_048_576)?).map_err(|e| SpeechError::Model(format!("config.json: {e}")))?;
+        cfg.validate().map_err(merr)?;
+        let gen_cfg: serde_json::Value =
+            serde_json::from_slice(&read("generation_config.json", 1_048_576)?).map_err(|e| SpeechError::Model(format!("generation_config.json: {e}")))?;
+        let tok = Tokenizer::from_json(&String::from_utf8_lossy(&read("tokenizer.json", 16_777_216)?))?;
+        tok.validate_vocabulary(cfg.vocab_size)?;
+        let weights = read("model.safetensors", 3_300_000_000)?;
         let alignment_heads = alignment_heads(&cfg, &gen_cfg)?;
-        let mut suppress: Vec<u32> =
-            gen_cfg["suppress_tokens"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect()).unwrap_or_default();
+        let mut suppress: Vec<u32> = gen_cfg["suppress_tokens"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_u64().and_then(|v| u32::try_from(v).ok())).collect())
+            .unwrap_or_default();
         suppress.extend(tok.non_text_specials());
         suppress.sort_unstable();
         suppress.dedup();
         let begin_suppress = gen_cfg["begin_suppress_tokens"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect())
+            .map(|a| a.iter().filter_map(|x| x.as_u64().and_then(|v| u32::try_from(v).ok())).collect())
             .unwrap_or_else(|| vec![220, tok.eot]);
         let model = Model::load(cfg, weights).map_err(merr)?;
         Ok(Self { id: id.to_string(), model: Mutex::new(model), tok, alignment_heads, suppress, begin_suppress })
@@ -103,7 +122,12 @@ impl Whisper {
         m.decoder.reset();
         let (logits, _) = m.decoder.forward(&[self.tok.sot], xa, false, None).map_err(merr)?;
         let l = Model::last_logits(&logits).map_err(merr)?;
-        let best = self.tok.languages.iter().max_by(|a, b| l[a.1 as usize].total_cmp(&l[b.1 as usize])).map(|x| x.0.clone());
+        let best = self
+            .tok
+            .languages
+            .iter()
+            .max_by(|a, b| l.get(a.1 as usize).unwrap_or(&f32::NEG_INFINITY).total_cmp(l.get(b.1 as usize).unwrap_or(&f32::NEG_INFINITY)))
+            .map(|x| x.0.clone());
         Ok(best.unwrap_or_else(|| "en".into()))
     }
 
@@ -266,6 +290,9 @@ impl Transcriber for Whisper {
 
     fn transcribe(&self, audio: &[f32], opts: &Options, progress: ProgressFn) -> Result<Transcript, SpeechError> {
         let mut m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        if audio.len() > 16_000 * 300 || audio.iter().any(|value| !value.is_finite()) {
+            return Err(SpeechError::Model("Whisper input must be finite and at most 300 seconds per chunk".into()));
+        }
         let n_mels = m.cfg.num_mel_bins;
         let content_frames = audio.len() / SAMPLES_PER_FRAME;
         let mut padded = audio.to_vec();
@@ -344,7 +371,7 @@ impl Transcriber for Whisper {
             }
             seek += advance;
         }
-        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words };
+        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words, next_word_id: 0 };
         t.normalize();
         crate::vad::tighten_words(audio, &mut t.words);
         if opts.diarize && !t.words.is_empty() {
@@ -382,6 +409,24 @@ mod tests {
         let error = alignment_heads(&config(usize::MAX, usize::MAX), &serde_json::Value::Null).unwrap_err();
         assert!(error.to_string().contains("alignment-head"));
         assert_eq!(alignment_heads(&config(4, 6), &serde_json::Value::Null).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn hostile_model_architecture_is_rejected_before_weights_are_read() {
+        let mut cfg = config(4, 6);
+        assert!(cfg.validate().is_ok());
+        cfg.decoder_layers = usize::MAX;
+        assert!(std::panic::catch_unwind(|| cfg.validate()).unwrap().is_err());
+        cfg = config(4, 6);
+        cfg.vocab_size = usize::MAX;
+        assert!(cfg.validate().is_err());
+        let dir = std::env::temp_dir().join(format!("filmcraft-whisper-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::File::create(dir.join("config.json")).unwrap();
+        file.set_len(1_048_577).unwrap();
+        let error = Whisper::load(&dir, "test").err().unwrap().to_string();
+        assert!(error.contains("limit"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

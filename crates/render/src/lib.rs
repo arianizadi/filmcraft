@@ -9,6 +9,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod alpha_mask;
 pub mod audio;
 pub mod audio_fx;
 pub mod blend;
@@ -20,6 +21,7 @@ pub mod gpufx;
 pub mod graphic_clip;
 pub mod graphics;
 pub mod image;
+pub mod lumetri_extra;
 pub mod lumetri_presets;
 pub mod luts;
 pub mod mask;
@@ -30,6 +32,8 @@ pub mod plan;
 pub mod preview;
 pub mod remix;
 pub mod scene;
+mod stretch;
+pub mod subject;
 pub mod track;
 pub mod transitions;
 pub mod vfx;
@@ -334,6 +338,21 @@ fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
     project.item(item.item).is_some_and(|pi| matches!(pi.kind, ItemKind::AdjustmentLayer { .. }))
 }
 
+/// Shared scene/camera color is evaluated before local clip effects (the per-shot trims).
+/// Both the CPU compositor and GPU planner consume this same ordered stack.
+fn standard_effects<'a>(project: &'a Project, item: &'a TrackItem) -> impl Iterator<Item = &'a filmcraft_project::EffectInstance> {
+    project
+        .color_workflow
+        .shared_effects(item)
+        .iter()
+        .chain(item.effects.iter())
+        .filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e))
+}
+
+fn has_standard_effects(project: &Project, item: &TrackItem) -> bool {
+    item.has_standard_effects() || project.color_workflow.has_shared_effects(item)
+}
+
 /// An adjustment layer as a layer over `below` (the composite of the tracks under it): `below`
 /// with the layer's effects, faded by its opacity and opacity masks and limited to its
 /// (Motion-transformed) frame, and the blend mode it mixes with.
@@ -352,7 +371,7 @@ fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick
         frame_rate: seq.settings.frame_rate.as_f64(),
         working: seq.settings.color.working,
     };
-    for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic)) {
+    for e in standard_effects(project, item) {
         mask::apply_effect(&mut adj, e, &cx);
     }
     let (op, bl) = opacity_blend(item, mt);
@@ -540,7 +559,7 @@ pub(crate) fn item_layer_ex(
     let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
     let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
     let pi = project.item(item.item)?;
-    if matches!(pi.kind, ItemKind::Graphic { .. }) && !(item.has_opacity_masks() || opts.effects && item.has_standard_effects()) {
+    if matches!(pi.kind, ItemKind::Graphic { .. }) && !(item.has_opacity_masks() || opts.effects && has_standard_effects(project, item)) {
         // vectors straight to the output: no resampling, crisp at any Motion scale
         let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion);
         let mut canvas = Image::new(w, h);
@@ -550,7 +569,7 @@ pub(crate) fn item_layer_ex(
     }
     // plain media: nothing but the frame itself reaches the output
     let plain_media = matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })
-        && !(opts.effects && item.has_standard_effects())
+        && !(opts.effects && has_standard_effects(project, item))
         && !item.effect("opacity").is_some_and(|e| e.enabled && !e.masks.is_empty());
     let mut fetched = None;
     if allow_region && plain_media {
@@ -589,7 +608,7 @@ pub(crate) fn item_layer_ex(
             frame_rate: seq.settings.frame_rate.as_f64(),
             working: seq.settings.color.working,
         };
-        for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+        for e in standard_effects(project, item) {
             if filmcraft_media::cancel::cancelled() {
                 return None;
             }

@@ -188,13 +188,27 @@ HEVC), so a requirement dropped by accident could never turn into a silent softw
 mode says "Encoder: Hardware" for H.265, and the summary line "HEVC Main (hardware encoder)".
 
 What it takes is H.264's list: MP4 (`hvc1`, the tag QuickTime reads) or QuickTime, AAC
-audio, 8-bit 4:2:0 BT.709 limited range, even sizes up to 8192, constant or one-pass variable
+audio, 8-bit SDR BT.709 or 10-bit PQ/HLG BT.2020 limited 4:2:0, even sizes up to 8192, constant or one-pass variable
 bitrate, the keyframe distance (closed GOPs, IDR pictures), and no B-frames. Keyframes are the
 random access points of types 16–21 (BLA, IDR, CRA).
 
 The sample entry's `hvcC` record is the one VideoToolbox wrote for the stream (read from the
 format description's sample description extension atoms, with the VPS / SPS / PPS), so profile,
 level and flags are the encoder's own. If it is missing the export stops with that reason.
+
+### VideoToolbox Main 10 HDR
+
+PQ and HLG sequences use a verified hardware Main 10 session with P010 input. The factory checks the
+actual hvcC profile and bit depth before accepting output. BT.2020 primaries/matrix, PQ or HLG
+transfer and limited range are set on the pixel buffers/session and written to the container.
+PQ output also carries mastering/content-light metadata and HDR10 SEI. The native regression reopens
+PQ MP4, HLG MP4 and PQ MOV, checks actual ten-bit decoded values and more than 256 luma levels,
+and uses external ffprobe/ffmpeg only as independent test oracles. These are short correctness
+checks, not an 8K real-time throughput claim. The probe actually encodes a small ten-bit frame;
+an unavailable capability falls back to the export format's explicit SDR policy.
+
+Apple API references: [Main 10 profile](https://developer.apple.com/documentation/videotoolbox/kvtprofilelevel_hevc_main10_autolevel),
+[10-bit biplanar format](https://developer.apple.com/documentation/corevideo/kcvpixelformattype_420ypcbcr10biplanarvideorange).
 
 ## Hardware H.265 (HEVC) encoding (Windows, NVENC)
 
@@ -248,8 +262,8 @@ level 4 High tier, which many hardware decoders refuse; it is now level 4.1 Main
   `nvenc::hevc_hdr_available` (a Main 10 session, cached, asked on the same background thread as the
   8-bit probe and short-circuiting when HEVC itself is missing) to `filmcraft_export::register_hdr_probe`,
   and the export job makes the export HDR for `Format::Hevc` only when
-  `filmcraft_export::hdr_available(Format::Hevc)` says so: on macOS (VideoToolbox is 8-bit) and on GPUs
-  without 10-bit an HDR sequence is tone-mapped to 8-bit SDR HEVC exactly as before, and `settings.sdr`
+  `filmcraft_export::hdr_available(Format::Hevc)` says so: on Macs or GPUs
+  without a verified 10-bit encoder an HDR sequence is tone-mapped to 8-bit SDR HEVC exactly as before, and `settings.sdr`
   still forces that. The pixels are real: `EncoderFrame::hdr` (encoded BT.2020 R'G'B', 3 floats per
   pixel) goes through `filmcraft_export::rgbf_to_yuv420_10` (BT.2020 non-constant-luminance matrix,
   Y = 64 + 876·Y', C = 512 + 896·C, 2x2 chroma average, NaN counts as 0, values clamp to 0..1 and codes
@@ -349,8 +363,7 @@ Details in [docs/performance.md](../../docs/performance.md).
 ## Not yet
 
 Zero-copy upload of decoded pictures into wgpu textures (`CVPixelBuffer`s on macOS, Direct3D 11
-textures on Windows); B-frames in the VideoToolbox encoders and 10-bit / HDR HEVC (Main 10) in
-VideoToolbox; VP9 and AV1 through VA-API (Linux), and VA-API encoding; field-coded H.264; 4:4:4 and 4:2:2 encoding with NVENC, HDR
+textures on Windows); B-frames in the VideoToolbox encoders; VP9 and AV1 through VA-API (Linux), and VA-API encoding; field-coded H.264; 4:4:4 and 4:2:2 encoding with NVENC, HDR
 H.264 with NVENC (HDR H.264 stays with the software encoder), HDR10 MaxCLL / MaxFALL measured from
 the pictures (they are written as 0, unknown), AV1 with NVENC, H.265 with the other Windows vendors and on Linux, and encoders
 from other vendors on Windows (through Media Foundation); VP9 / AV1 4:4:4 and 12-bit on Windows.

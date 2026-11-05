@@ -40,7 +40,9 @@ macro_rules! tlf {
     };
 }
 
+mod agent_pairing;
 pub mod agent_review;
+pub mod agent_workflow;
 pub mod automation;
 pub mod brand;
 pub mod calc;

@@ -90,6 +90,7 @@ impl EffectDef {
     }
     pub fn instance(&self) -> EffectInstance {
         EffectInstance {
+            instance_id: 0,
             effect: self.id.to_string(),
             enabled: true,
             params: self.params.iter().map(|p| (p.id.to_string(), Param::new(p.default.clone()))).collect(),
@@ -103,6 +104,9 @@ impl EffectDef {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectInstance {
+    /// Stable placed-instance identity. Zero belongs to unplaced definitions/legacy input.
+    #[serde(default, skip_serializing_if = "is_unplaced_identity")]
+    pub instance_id: u64,
     pub effect: String,
     pub enabled: bool,
     pub params: BTreeMap<String, Param>,
@@ -120,7 +124,26 @@ pub struct EffectInstance {
     pub layer: Option<Box<crate::graphic_design::LayerExtra>>,
 }
 
+fn is_unplaced_identity(id: &u64) -> bool {
+    *id == 0
+}
+
+/// Compare effect values independently of their placed-instance identities.
+/// Identity remains part of normal PartialEq, so project/history comparisons still see it.
+pub fn same_content(a: &[EffectInstance], b: &[EffectInstance]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_content(b))
+}
+
 impl EffectInstance {
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.effect == other.effect
+            && self.enabled == other.enabled
+            && self.params == other.params
+            && self.masks == other.masks
+            && self.post_fader == other.post_fader
+            && self.essential == other.essential
+            && self.layer == other.layer
+    }
     pub fn def(&self) -> Option<&'static EffectDef> {
         find_effect(&self.effect)
     }

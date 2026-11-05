@@ -537,3 +537,257 @@ async fn failed_output_stops_the_reader() {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(30), server).await;
     assert!(ended.is_ok(), "the server kept reading after its output failed");
 }
+
+#[test]
+fn automatic_tools_expose_strict_complete_schemas() {
+    let m = FilmcraftMcp::headless(Session::default());
+    for (name, fields) in [
+        (
+            "prepare_footage",
+            vec![
+                "items",
+                "paths",
+                "profile",
+                "mode",
+                "music_item",
+                "name",
+                "max_shots",
+                "target_duration_ticks",
+                "overrides",
+                "analyze",
+                "normalize_audio",
+                "captions",
+                "apply",
+                "transcribe",
+                "qc",
+            ],
+        ),
+        ("deliver_edit", vec!["plan", "base_revision", "path", "profile", "wait", "session_id", "operation_id", "idempotency_key"]),
+        ("media_search", vec!["query", "limit", "thumbnails", "embedding"]),
+        (
+            "footage_analysis",
+            vec![
+                "subject",
+                "start",
+                "end",
+                "stride_frames",
+                "max_frames",
+                "video",
+                "audio",
+                "speech",
+                "model",
+                "music",
+                "waveform",
+                "details",
+                "black_threshold",
+                "freeze_threshold",
+                "shot_threshold",
+                "silence_db",
+                "click_threshold",
+            ],
+        ),
+        ("prepare_status", vec!["job"]),
+    ] {
+        let tool = m.tool_router.get(name).unwrap();
+        let schema = Value::Object((*tool.input_schema).clone());
+        assert_eq!(schema["additionalProperties"], false, "{name}: {schema}");
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), fields.len(), "{name}: {schema}");
+        for field in fields {
+            assert!(properties.contains_key(field), "{name} missing {field}: {schema}");
+        }
+    }
+    let schema = Value::Object((*m.tool_router.get("prepare_footage").unwrap().input_schema).clone());
+    assert_eq!(schema["properties"]["max_shots"]["minimum"], 1);
+    assert_eq!(schema["properties"]["max_shots"]["maximum"], 96);
+    assert_eq!(schema["properties"]["apply"]["enum"], json!([false, null]));
+    let text = schema.to_string();
+    for value in ["talkingHead", "selects", "rec2100-pq", "referenceLook", "captionStyle", "fpsNum", "background_color"] {
+        assert!(text.contains(value), "schema omitted {value}");
+    }
+    let required = m.tool_router.get("deliver_edit").unwrap().input_schema.get("required").unwrap().as_array().unwrap();
+    for field in ["plan", "base_revision", "path", "session_id", "operation_id", "idempotency_key"] {
+        assert!(required.iter().any(|v| v == field));
+    }
+}
+
+#[test]
+fn automatic_tools_preserve_omission_false_zero_and_nullable_profile_fields() {
+    let empty: PrepareFootageParams = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(workflow::engine_params(&empty).unwrap(), json!({}), "unset flags retain engine defaults");
+    let input = json!({"items":[1,2],"paths":["/a.mov"],"profile":"Studio","mode":"dj","music_item":2,"name":"Cut","max_shots":9,"target_duration_ticks":254016000000_i64,
+        "overrides":{"referenceLook":null,"pausePaddingTicks":0,"loudnessLufs":-18.0,"captionStyle":{"background":false,"line_spacing":1.3,"color":[1,2,3,255]},"delivery":{"fpsNum":24,"fpsDen":1,"colorSpace":"rec2100-hlg","captions":"none"}},
+        "analyze":false,"normalize_audio":false,"captions":false,"apply":false,"transcribe":false,"qc":false});
+    let p: PrepareFootageParams = serde_json::from_value(input.clone()).unwrap();
+    let mapped = workflow::engine_params(&p).unwrap();
+    assert_eq!(mapped["mode"], "dj");
+    assert_eq!(mapped["musicItem"], 2);
+    assert_eq!(mapped["maxShots"], 9);
+    assert_eq!(mapped["targetDurationTicks"], 254016000000_i64);
+    assert_eq!(mapped["overrides"], input["overrides"]);
+    for flag in ["analyze", "normalizeAudio", "captions", "apply", "transcribe", "qc"] {
+        assert_eq!(mapped[flag], false, "{mapped}");
+    }
+    assert!(mapped.get("music_item").is_none());
+    let empty_override: workflow::ProfileOverrides = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(serde_json::to_value(empty_override).unwrap(), json!({}), "absent look differs from explicit null");
+    for bad in [
+        json!({"unknown":true}),
+        json!({"mode":"automatic"}),
+        json!({"analyze":"false"}),
+        json!({"max_shots":1.5}),
+        json!({"overrides":{"name":"forbidden"}}),
+        json!({"overrides":{"referenceLook":42}}),
+        json!({"overrides":{"delivery":{"format":"mjpeg"}}}),
+    ] {
+        assert!(serde_json::from_value::<PrepareFootageParams>(bad).is_err());
+    }
+    let analysis: FootageAnalysisParams = serde_json::from_value(json!({"subject":{"target":"source","item":12,"effects":"pre"},"start":0,"end":42,"stride_frames":3,"max_frames":4,"video":false,"audio":false,"speech":false,"music":false,"waveform":false,"details":false,"black_threshold":0.9,"freeze_threshold":0.0,"shot_threshold":0.2,"silence_db":-50.0,"click_threshold":0.5})).unwrap();
+    let mapped = workflow::engine_params(&analysis).unwrap();
+    assert_eq!(mapped["subject"], json!({"target":"source","item":12,"effects":"pre"}));
+    for key in ["strideFrames", "maxFrames", "blackThreshold", "freezeThreshold", "shotThreshold", "silenceDb", "clickThreshold"] {
+        assert!(mapped.get(key).is_some(), "{mapped}");
+    }
+    assert_eq!(mapped["freezeThreshold"], 0.0);
+    assert_eq!(mapped["video"], false);
+    let huge: FootageAnalysisParams = serde_json::from_value(json!({"subject":{"target":"source","item":12},"black_threshold":1e80})).unwrap();
+    assert_eq!(
+        workflow::engine_params(&huge).unwrap()["blackThreshold"],
+        json!(1e80),
+        "out-of-range numbers must reach engine validation, never become an omitted default"
+    );
+    let search: MediaSearchParams = serde_json::from_value(
+        json!({"query":"room","thumbnails":false,"embedding":{"model":{"id":"custom","dimension":2,"provenance":"test source"},"vector":[1.0,0.0]}}),
+    )
+    .unwrap();
+    assert_eq!(
+        workflow::engine_params(&search).unwrap(),
+        json!({"query":"room","thumbnails":false,"embedding":{"model":{"id":"custom","dimension":2,"provenance":"test source"},"vector":[1.0,0.0]}})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_tools_describe_and_execute_read_queries_without_inventing_results() {
+    let mut session = Session::default();
+    let item = session.execute("file.newBarsAndTone", json!({"width":32,"height":18,"seconds":0.25})).unwrap()["item"].as_u64().unwrap();
+    let project = session.project.clone();
+    let m = FilmcraftMcp::headless(session);
+    for (command, tool) in [
+        ("workflow.prepareAsync", "prepare_footage"),
+        ("workflow.status", "prepare_status"),
+        ("workflow.deliver", "deliver_edit"),
+        ("library.search", "media_search"),
+        ("analysis.footage", "footage_analysis"),
+    ] {
+        let response = m.command_describe(Parameters(DescribeParams { id: command.into() })).await.unwrap();
+        assert_ne!(response.is_error, Some(true), "{response:?}");
+        let value = serde_json::to_value(response).unwrap();
+        let report: Value = serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(report["schemaTool"], tool);
+        assert_eq!(report["schemaStatus"], "typed_mcp_tool");
+        assert!(report["inputSchema"].is_object());
+        assert!(report["examples"][0].is_object());
+    }
+    let search = m.media_search(Parameters(serde_json::from_value(json!({"query":"laptop","limit":2})).unwrap())).await.unwrap();
+    assert_ne!(search.is_error, Some(true));
+    let search = serde_json::to_value(search).unwrap();
+    let search: Value = serde_json::from_str(search["content"].as_array().unwrap().iter().find_map(|v| v["text"].as_str()).unwrap()).unwrap();
+    assert_eq!(search["hits"], json!([]));
+    assert_eq!(search["semantic"]["status"], "unavailable_for_indexed_ranges");
+    let analysis = m
+        .footage_analysis(Parameters(
+            serde_json::from_value(
+                json!({"subject":{"target":"source","item":item},"max_frames":3,"audio":false,"music":false,"waveform":false,"speech":false}),
+            )
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(analysis.is_error, Some(true), "{analysis:?}");
+    let analysis = serde_json::to_value(analysis).unwrap();
+    let analysis: Value = serde_json::from_str(analysis["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(analysis["frames"].as_array().is_some_and(|v| !v.is_empty() && v.len() <= 3), "{analysis}");
+    let invalid_analysis = m
+        .footage_analysis(Parameters(
+            serde_json::from_value(json!({"subject":{"target":"source","item":item},"black_threshold":1e80,"audio":false,"speech":false})).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_analysis.is_error, Some(true), "hostile threshold must fail instead of silently using a default");
+    let rejected = m.prepare_footage(Parameters(serde_json::from_value(json!({"items":[item],"apply":true})).unwrap())).await.unwrap();
+    assert_eq!(rejected.is_error, Some(true));
+    let Backend::Headless(session) = &*m.backend else {
+        panic!("headless");
+    };
+    assert_eq!(*session.lock().unwrap().project, *project);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn focused_preparation_and_delivery_tools_stage_approve_and_retry_one_export() {
+    let mut session = Session::default();
+    let item = session.execute("file.newBarsAndTone", json!({"width":32,"height":18,"seconds":0.25})).unwrap()["item"].as_u64().unwrap();
+    let mut client = Client::start(session);
+    client.init().await;
+    let identity = result_json(&client.call(1, "agent_session", json!({})).await);
+    let before = result_json(&client.call(2, "project_inspect", json!({})).await);
+    let job = result_json(
+        &client
+            .call(
+                3,
+                "prepare_footage",
+                json!({"items":[item],"mode":"selects","analyze":false,"transcribe":false,"normalize_audio":false,"captions":false,"qc":false,
+        "overrides":{"delivery":{"width":32,"height":18,"fpsNum":24,"fpsDen":1,"format":"prores","colorSpace":"rec709","captions":"none"}}}),
+            )
+            .await,
+    );
+    assert_eq!(job["status"], "preparing");
+    assert!(job["job"].is_u64());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut request_id = 4;
+    let prepared = loop {
+        let report = result_json(&client.call(request_id, "prepare_status", json!({"job":job["job"]})).await);
+        request_id += 1;
+        if report["status"] == "staged" {
+            break report;
+        }
+        assert_ne!(report["status"], "failed", "{report}");
+        assert!(tokio::time::Instant::now() < deadline, "{report}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(result_json(&client.call(request_id, "project_inspect", json!({})).await), before, "background preparation must not edit live project");
+    request_id += 1;
+    let approved = result_json(
+        &client
+            .call(
+                request_id,
+                "apply_plan",
+                json!({"plan":prepared["plan"],"session_id":identity["sessionId"],"operation_id":"typed-approved","idempotency_key":"typed-approved"}),
+            )
+            .await,
+    );
+    request_id += 1;
+    assert_eq!(approved["status"], "committed");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("approved.mov");
+    let args = json!({"plan":prepared["plan"],"base_revision":approved["afterRevision"],"path":path,"session_id":identity["sessionId"],"operation_id":"typed-delivery","idempotency_key":"typed-delivery"});
+    let first = result_json(&client.call(request_id, "deliver_edit", args.clone()).await);
+    request_id += 1;
+    assert_eq!(first["status"], "committed", "{first}");
+    let repeated = result_json(&client.call(request_id, "deliver_edit", args).await);
+    request_id += 1;
+    assert_eq!(repeated["replayed"], true);
+    assert_eq!(repeated["result"], first["result"]);
+    let export = first["result"]["export"]["job"].as_u64().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let report = result_json(&client.call(request_id, "command_run", json!({"id":"jobs.get","params":{"job":export}})).await);
+        request_id += 1;
+        if report["finished"] == true {
+            assert_eq!(report["state"], "completed", "{report}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{report}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(path.metadata().unwrap().len() > 0);
+}

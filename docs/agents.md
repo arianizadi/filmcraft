@@ -458,3 +458,113 @@ text, graphics, effect, transition, and settings color controls retain their est
 The label editor stores opaque sRGB bytes; it does not reinterpret floating-point effect colors,
 HDR values, or alpha. The fallback shares egui's picker implementation with those controls,
 without replacing their command or color-format semantics.
+
+## Saved review, dialogue approvals and editing profiles
+
+Project schema v18 stores review data with the project. Save the `.fcproj` after adding review
+records. `review.checkpoint {name}` records a named immutable checkpoint; `review.checkpoints`
+lists them and `review.diff {checkpoint}` returns typed added, removed, moved and changed entities
+against the current document. `review.deleteCheckpoint` explicitly removes one. Snapshots omit
+review records, preventing recursive checkpoint growth; the limits are eight checkpoints and eight
+MiB per snapshot. Review notes use `review.annotate {sequence?,start?,end?,text,kind?,author?,status?}`
+(`kind`: `note`, `finding`, `suggestion`; `status`: `open`, `accepted`, `dismissed`). An `annotation`
+ID updates an existing note. `review.annotations` and `review.activity` read the saved records.
+Open notes appear at their exact timeline positions and in Agent Review. Direct edits are logged;
+merged gestures and edit groups produce one event. Activity follows the document's undo snapshots.
+No credentials or request parameters are saved in the activity ledger.
+
+For partial approval, call `agent.subset {plan,steps:[0,2]}` with explicit original command indices.
+This produces a **new** immutable plan and diff; it does not apply anything. Original execution order
+is retained, step-result references are remapped, and a selected step that depends on an omitted step
+is refused. The original baseline must still match both document identity and revision. Render and
+inspect the new plan before `agent.apply`. Native Agent Review exposes the same step selection and
+requires a new preview before its approval control becomes available.
+
+`transcript.inspect` returns `sourceWordId` alongside timeline positions. `transcript.sourceWords
+{item}` returns the persisted source transcript, including each word's `id`. IDs survive text
+correction, sorting and reopening. Correct words with `transcript.patchWords {item,words:[{id,text?,
+start?,end?}]}` rather than using a transient sequence word index. New imported/recognized words
+receive new IDs; duplicate supplied IDs are refused. Propose dialogue cuts with:
+
+```json
+{"command":"transcript.proposeCuts","params":{"ranges":[
+  {"clip":41,"fromWordId":7,"toWordId":8,"mode":"extract"},
+  {"clip":41,"fromWordId":12,"mode":"lift"}
+]}}
+```
+
+Each range is a separate plan step with its linked clip IDs and affected tracks. Overlapping ranges
+and locked source/linked tracks are refused. Ripple cuts run from right to left. Approve an individual
+range by generating `agent.subset` from its step index; indices are in the returned command order.
+Source transcripts are retained when timeline words are cut.
+
+`captions.translate {sourceTrack,language,name?,translations:[{caption,text}]}` creates a separate
+caption track from **explicit supplied translated text**. Supply each source caption ID exactly
+once; no machine translation engine is implied or downloaded. The new cue IDs are distinct, while
+all start times, durations, styles, speakers and cue settings are retained. Stage it through
+`agent.plan` to review its text and render before applying.
+
+`profile.save {profile}` appends a named immutable profile version. `profile.list`, `profile.get
+{name,version?}` and `profile.resolve {name,version?,overrides?}` read reusable reference-look,
+skin-tone, pacing, pause-padding, caption-style, LUFS and delivery preferences. Resolving one-off
+overrides leaves the stored version unchanged. `profile.plan` proposes activating those preferences
+and applies caption style to unlocked caption tracks, exact delivery dimensions/rate/color, measured
+BS.1770 loudness for audible clips, and a named shared look when supplied. Set `delivery:false` or
+`normalizeAudio:false` to leave those controls unchanged. Pacing and pause-padding are consumed by
+`workflow.autoEdit` when proposing dialogue cuts; no semantic take selection is implied.
+
+`profile.layout {kind:"pip"|"split"|"vertical",clips:[id],sequence?,variant:true}` builds an editable
+plan using sequence settings and ordinary motion parameters. PiP and split require two video clips;
+vertical accepts one to 32. The default duplicates the sequence so the original remains available.
+Locked targets and animated motion are refused rather than silently replacing animation. Review
+track order and framing in the exact plan render; the motion controls remain editable after approval.
+
+## Automatic local editing
+
+`workflow.prepare {paths:[absolutePath],mode:"talkingHead"|"dj"|"selects",profile?,transcribe:true}`
+is the footage entry point. Alternatively use `items:[sourceId]`. Preparation imports and optionally
+transcribes in an isolated reader with ingest/copy jobs disabled; it adds source metadata and words
+to the proposed snapshot, never to the live document before approval. No model downloads occur.
+Local transcription requires an installed model; missing recognition preserves dialogue and reports
+why cuts/captions were unavailable. `workflow.autoEdit` works directly on imported sources. Both
+return ordinary immutable edit plans; `apply:true` additionally requires Edit permission.
+
+Talking-head mode removes only known fillers and long pauses evidenced by a saved transcript;
+otherwise it preserves the source range. DJ mode uses an available measured beat interval or labels
+its two-second timing fallback. Selects use measured sharpness/motion samples, with timing-only
+fallback when analysis is unavailable. These are deterministic heuristics, not semantic take selection
+or a claim about who/what appears. Profiles set exact delivery dimensions/rate/color, caption style,
+a linked named shared look when supplied, and measured BS.1770 loudness for audible clips. Silent
+clips are reported; automatic loudness reads have a one-hour budget. Analysis runs up to four sources
+in parallel. Defaults preserve all original source files and create a separate sequence.
+
+The native Agent Review window's **Automatic edit from footage** panel runs preparation in the
+background. It adopts the result only if the original project identity, revision and snapshot still
+match. Keep editing freely; a changed baseline produces a stale-plan message and requires preparing
+again. Explicit `dependsOn:[stepIndex]` setup dependencies accompany automatic plans, so partial
+selection cannot omit required source import or sequence creation. Review the diff and before/after
+frames and approve as one undo step.
+
+`workflow.deliver {plan,path,wait:true}` requires an applied plan whose exact project snapshot still
+matches. It starts the existing export job, then reopens the file through `qc.export` against the
+requested duration, frame rate, dimensions, color, audio and captions. `wait:false` returns the export
+job plus the precise pending QC command. Native review polls the export and verifies in the background.
+Failed or unsupported checks are shown as failed/unknown; an export is called verified only when the
+QC tool returns `verified:true`. Delivery and file writes remain outside edit transactions.
+
+Native preparation, export verification and explicit model downloads use the durable job registry.
+The review panel exposes each job ID, input revision, progress and a Cancel control. A prepared
+artifact remains running until its unchanged-baseline adoption succeeds; cancellation and stale
+adoption become terminal job errors, and reopening marks an unfinished job interrupted. Generic
+`transcript.downloadModel {model,wait:false}` also returns a stable job ID with `jobs.get` and
+`jobs.cancel`; `wait:true` is an explicit blocking option. The native download controls show the
+catalogue size, source and licence before the user chooses Download. No workflow downloads a model
+implicitly.
+
+Recognition reads bounded audio windows (at most 300 seconds and eight million decoded channel
+samples), maps every word back to exact source ticks and retains word identity only through explicit
+IDs or uniquely verified source-time/text matches. Retired ID counters survive transcript deletion.
+One recording is bounded to 24 hours, 4096 windows and one million words. Diarization labels from
+separate windows are named separately rather than claiming a cross-window speaker match.
+Automatic delivery chooses a new output name and refuses existing movie/sidecar files, preserving
+original footage and earlier deliveries.

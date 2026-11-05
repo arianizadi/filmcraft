@@ -40,8 +40,10 @@ use objc2_core_video::{
     CVAttachmentMode, CVImageBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
     CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress, kCVImageBufferColorPrimaries_ITU_R_709_2,
-    kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-    kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferTransferFunction_ITU_R_2100_HLG, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferTransferFunctionKey,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVImageBufferYCbCrMatrixKey, kCVPixelBufferHeightKey,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionCopyProperty, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
@@ -49,12 +51,14 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
     kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kVTCompressionPropertyKey_YCbCrMatrix, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel, kVTProfileLevel_HEVC_Main10_AutoLevel,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 /// The pixel format of the planar input path: biplanar Y + interleaved CbCr, video range.
 const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+/// CoreVideo 10-bit bi-planar video range: 10 bits in the high bits of each little-endian u16.
+const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
 /// The pixel format of the RGB input path: 8-bit B, G, R, A bytes (`kCVPixelFormatType_32BGRA`).
 const BGRA_8: u32 = u32::from_be_bytes(*b"BGRA");
 /// Largest compressed frame accepted from the callback (a sanity cap on a size we do not control).
@@ -77,13 +81,27 @@ pub enum VtProfile {
     High,
     /// HEVC Main: 8-bit 4:2:0.
     HevcMain,
+    /// HEVC Main 10 with BT.2020 and PQ transfer.
+    HevcMain10Pq,
+    /// HEVC Main 10 with BT.2020 and HLG transfer.
+    HevcMain10Hlg,
 }
 
 impl VtProfile {
+    pub fn is_ten_bit(self) -> bool {
+        matches!(self, Self::HevcMain10Pq | Self::HevcMain10Hlg)
+    }
+    pub fn signal(self) -> filmcraft_export::ColorSignal {
+        match self {
+            Self::HevcMain10Pq => filmcraft_export::ColorSignal::PQ,
+            Self::HevcMain10Hlg => filmcraft_export::ColorSignal::HLG,
+            _ => filmcraft_export::ColorSignal::default(),
+        }
+    }
     pub fn codec(self) -> VtCodec {
         match self {
             VtProfile::Baseline | VtProfile::Main | VtProfile::High => VtCodec::H264,
-            VtProfile::HevcMain => VtCodec::Hevc,
+            VtProfile::HevcMain | VtProfile::HevcMain10Pq | VtProfile::HevcMain10Hlg => VtCodec::Hevc,
         }
     }
 }
@@ -102,6 +120,8 @@ pub enum VtRate {
 pub enum VtInput {
     /// Biplanar 8-bit 4:2:0 (NV12), filled from planar Y'CbCr by [`VtEncoder::encode`].
     Nv12,
+    /// 10-bit video-range biplanar Y/CbCr (CoreVideo x420).
+    P010,
     /// 8-bit BGRA, filled from the export's straight RGBA8 picture by [`VtEncoder::encode_rgba`];
     /// VideoToolbox converts it to 4:2:0.
     Bgra,
@@ -419,6 +439,49 @@ fn fill(pb: &CVImageBuffer, w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) ->
     Ok(())
 }
 
+/// Copy validated planar codes to the high ten bits of an interleaved CoreVideo plane.
+fn copy_10(dst: &mut [u8], stride: usize, size: (usize, usize), sources: &[&[u16]]) -> Result<(), String> {
+    let (w, h) = size;
+    if w == 0 || h == 0 || !matches!(sources.len(), 1 | 2) {
+        return Err("invalid 10-bit plane shape".into());
+    }
+    let row = w.checked_mul(sources.len()).and_then(|n| n.checked_mul(2)).ok_or("10-bit row overflows")?;
+    let count = w.checked_mul(h).ok_or("10-bit plane overflows")?;
+    if stride < row || stride.checked_mul(h).is_none_or(|n| n > dst.len()) || sources.iter().any(|s| s.len() != count || s.iter().any(|v| *v > 1023)) {
+        return Err("invalid 10-bit plane bounds or code value".into());
+    }
+    for (y, dst) in dst.chunks_mut(stride).take(h).enumerate() {
+        for (x, pixel) in dst[..row].chunks_exact_mut(sources.len() * 2).enumerate() {
+            for (component, source) in sources.iter().enumerate() {
+                let code = source.get(y * w + x).ok_or("10-bit sample out of bounds")?;
+                let bytes = (code << 6).to_le_bytes();
+                let pair = pixel.get_mut(component * 2..component * 2 + 2).ok_or("10-bit destination out of bounds")?;
+                pair.copy_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(())
+}
+fn fill_10(pb: &CVImageBuffer, w: usize, h: usize, y: &[u16], u: &[u16], v: &[u16]) -> Result<(), String> {
+    // SAFETY: `pb` is a valid retained pixel buffer supplied by `new_buffer`.
+    if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags(0)) } != 0 {
+        return Err("cannot lock 10-bit input buffer".into());
+    }
+    let mut lock = Locked(pb);
+    let (dst, stride, width, height) = plane_mut(pb, &mut lock, 0)?;
+    if width < w || height < h {
+        return Err("10-bit luma buffer is smaller than picture".into());
+    }
+    copy_10(dst, stride, (w, h), &[y])?;
+    let (dst, stride, width, height) = plane_mut(pb, &mut lock, 1)?;
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    if width < cw || height < ch {
+        return Err("10-bit chroma buffer is smaller than picture".into());
+    }
+    copy_10(dst, stride, (cw, ch), &[u, v])?;
+    Ok(())
+}
+
 /// Copy a straight RGBA8 picture (`w`×`h`, tightly packed) into a BGRA buffer, swapping R and B.
 fn fill_bgra(pb: &CVImageBuffer, w: usize, h: usize, rgba: &[u8]) -> Result<(), String> {
     let row_bytes = w.checked_mul(4).ok_or("picture width overflows")?;
@@ -507,7 +570,8 @@ impl VtEncoder {
     /// Create a session that takes planar Y'CbCr pictures ([`VtEncoder::encode`]), or say why
     /// hardware encoding is not used for this configuration.
     pub fn new(config: VtConfig) -> Result<VtEncoder, String> {
-        Self::with_input(config, VtInput::Nv12)
+        let input = if config.profile.is_ten_bit() { VtInput::P010 } else { VtInput::Nv12 };
+        Self::with_input(config, input)
     }
 
     /// Create a session that takes the export's RGBA pictures as they are ([`VtEncoder::encode_rgba`]):
@@ -515,6 +579,9 @@ impl VtEncoder {
     /// this VideoToolbox converts RGB is known from the first picture, not from creating the session:
     /// `hardware_encode` replaces a session that refuses it with a planar one ([`VtEncoder::new`]).
     pub fn with_rgba_input(config: VtConfig) -> Result<VtEncoder, String> {
+        if config.profile.is_ten_bit() {
+            return Err("Main 10 requires encoded HDR float pictures through the planar 10-bit path".into());
+        }
         Self::with_input(config, VtInput::Bgra)
     }
 
@@ -539,6 +606,7 @@ impl VtEncoder {
 
         let pixel_format = match input {
             VtInput::Nv12 => NV12_VIDEO,
+            VtInput::P010 => P010_VIDEO,
             VtInput::Bgra => BGRA_8,
         };
         let (pf, cw, ch) = (CFNumber::new_i32(pixel_format as i32), CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
@@ -591,6 +659,7 @@ impl VtEncoder {
                     VtProfile::Main => kVTProfileLevel_H264_Main_AutoLevel,
                     VtProfile::High => kVTProfileLevel_H264_High_AutoLevel,
                     VtProfile::HevcMain => kVTProfileLevel_HEVC_Main_AutoLevel,
+                    VtProfile::HevcMain10Pq | VtProfile::HevcMain10Hlg => kVTProfileLevel_HEVC_Main10_AutoLevel,
                 },
             )
         };
@@ -644,14 +713,24 @@ impl VtEncoder {
                 kVTCompressionPropertyKey_ColorPrimaries,
                 kVTCompressionPropertyKey_TransferFunction,
                 kVTCompressionPropertyKey_YCbCrMatrix,
-                kCVImageBufferColorPrimaries_ITU_R_709_2,
-                kCVImageBufferTransferFunction_ITU_R_709_2,
-                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                if c.profile.is_ten_bit() { kCVImageBufferColorPrimaries_ITU_R_2020 } else { kCVImageBufferColorPrimaries_ITU_R_709_2 },
+                match c.profile {
+                    VtProfile::HevcMain10Pq => kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                    VtProfile::HevcMain10Hlg => kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+                    _ => kCVImageBufferTransferFunction_ITU_R_709_2,
+                },
+                if c.profile.is_ten_bit() { kCVImageBufferYCbCrMatrix_ITU_R_2020 } else { kCVImageBufferYCbCrMatrix_ITU_R_709_2 },
             )
         };
-        let _ = set_value(session, pk, pv.as_ref());
-        let _ = set_value(session, tk, tv.as_ref());
-        let _ = set_value(session, mk, mv.as_ref());
+        if c.profile.is_ten_bit() {
+            require(set_value(session, pk, pv.as_ref()), "HDR color primaries")?;
+            require(set_value(session, tk, tv.as_ref()), "HDR transfer function")?;
+            require(set_value(session, mk, mv.as_ref()), "HDR matrix")?;
+        } else {
+            let _ = set_value(session, pk, pv.as_ref());
+            let _ = set_value(session, tk, tv.as_ref());
+            let _ = set_value(session, mk, mv.as_ref());
+        }
         Ok(())
     }
 
@@ -695,6 +774,7 @@ impl VtEncoder {
                     self.config.height as usize,
                     match self.input {
                         VtInput::Nv12 => NV12_VIDEO,
+                        VtInput::P010 => P010_VIDEO,
                         VtInput::Bgra => BGRA_8,
                     },
                     Some(self.attrs.as_ref()),
@@ -715,6 +795,33 @@ impl VtEncoder {
         }
         let buffer = self.new_buffer()?;
         fill(&buffer, self.config.width as usize, self.config.height as usize, y, u, v)?;
+        self.encode_picture(index, &buffer)
+    }
+
+    /// Submit a 10-bit picture in the declared BT.2020 PQ/HLG signal. Values above 1023 are rejected.
+    pub fn encode_10(&mut self, index: u64, y: &[u16], u: &[u16], v: &[u16]) -> Result<Vec<VtPacket>, String> {
+        if self.input != VtInput::P010 {
+            return Err("this session does not take 10-bit pictures".into());
+        }
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        let pixels = w.checked_mul(h).ok_or("picture size overflows")?;
+        let chroma = w.div_ceil(2).checked_mul(h.div_ceil(2)).ok_or("chroma size overflows")?;
+        if y.len() != pixels || u.len() != chroma || v.len() != chroma || y.iter().chain(u).chain(v).any(|v| *v > 1023) {
+            return Err("invalid 10-bit planes".into());
+        }
+        let buffer = self.new_buffer()?;
+        fill_10(&buffer, w, h, y, u, v)?;
+        // SAFETY: framework constants are immutable and `buffer` is retained for all calls.
+        unsafe {
+            buffer.set_attachment(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020.as_ref(), CVAttachmentMode::ShouldPropagate);
+            let transfer = if self.config.profile == VtProfile::HevcMain10Pq {
+                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+            } else {
+                kCVImageBufferTransferFunction_ITU_R_2100_HLG
+            };
+            buffer.set_attachment(kCVImageBufferTransferFunctionKey, transfer.as_ref(), CVAttachmentMode::ShouldPropagate);
+            buffer.set_attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020.as_ref(), CVAttachmentMode::ShouldPropagate);
+        }
         self.encode_picture(index, &buffer)
     }
 
@@ -798,5 +905,20 @@ impl VtEncoder {
             }
         }
         Ok(packets)
+    }
+}
+
+#[cfg(test)]
+mod main10_tests {
+    use super::*;
+    #[test]
+    fn p010_plane_packing_and_hostile_bounds() {
+        let mut output = vec![0; 16];
+        copy_10(&mut output, 8, (2, 1), &[&[64, 940], &[512, 1023]]).unwrap();
+        assert_eq!(&output[..8], &[0, 16, 0, 128, 0, 235, 192, 255]);
+        assert!(copy_10(&mut output, 0, (2, 1), &[&[64, 940]]).is_err());
+        assert!(copy_10(&mut output, 8, (2, 1), &[&[1024, 0]]).is_err());
+        assert!(copy_10(&mut output, 8, (usize::MAX, usize::MAX), &[&[]]).is_err());
+        assert!(copy_10(&mut output, 8, (2, 1), &[&[0]]).is_err());
     }
 }

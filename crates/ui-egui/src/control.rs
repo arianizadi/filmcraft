@@ -53,6 +53,8 @@ use crate::state::{Mode, PlaybackRes, ThumbnailMode, Tool};
 pub const RETRY: &str = "\u{1}";
 
 pub struct ControlRequest {
+    /// Identity authenticated by the native transport, never accepted from request parameters.
+    pub client: Option<String>,
     pub method: String,
     pub params: Value,
     pub reply: Sender<Value>,
@@ -61,7 +63,7 @@ pub struct ControlRequest {
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, client: None }, rx)
     }
 }
 
@@ -486,6 +488,41 @@ fn handle_synthetic_input(app: &mut FilmcraftApp, p: &Value, method: &str) -> Ou
 /// Execute one control request. Synthetic input is capped by `MAX_SYNTHETIC_EVENTS` before queueing, screenshot crops stay symbolic until capture, and
 /// `gfxEdit` layer identity is resolved from the document.
 pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    let Some(client) = req.client.as_deref() else { return handle_authorized(app, ctx, req) };
+    let grant = match app.session.pairings.grant(client, app.session.path.as_deref()) {
+        Ok(g) => g,
+        Err(e) => return err(e),
+    };
+    if matches!(req.method.as_str(), "engine.execute" | "ui.menu.invoke") {
+        let Some(id) = req.params.get("command").or_else(|| req.params.get("id")).and_then(Value::as_str) else { return err("missing command") };
+        if let Err(e) = filmcraft_engine::pairing::authorize(&app.session, &grant, id, req.params.get("params").unwrap_or(&Value::Null)) {
+            return err(e);
+        }
+        if id == "agent.pairRequest" {
+            return err("paired clients cannot create other connections");
+        }
+    } else if !(matches!(req.method.as_str(), "engine.commands" | "ui.menu.list" | "perf.stats" | "ui.timeline.hit" | "ui.timeline.locate")) {
+        return err(
+            "permission_denied: folder-scoped connections use engine commands; synthetic input and window inspection/screenshots require the owner connection; use render.frames for scoped footage",
+        );
+    }
+    let previous_permission = app.session.operations.permission;
+    let previous_services = app.session.services.clone();
+    app.session.operations.permission = grant.permission;
+    app.session.services = std::sync::Arc::new(filmcraft_engine::pairing::ScopedServices { inner: previous_services.clone(), grant: grant.clone() });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle_authorized(app, ctx, req)));
+    app.session.operations.permission = previous_permission;
+    app.session.services = previous_services;
+    let mut outcome = outcome.unwrap_or_else(|_| err("internal error in paired request; inspect the project before retrying"));
+    if let Outcome::Done(response) = &mut outcome
+        && let Some(id) = req.params.get("command").or_else(|| req.params.get("id")).and_then(Value::as_str)
+    {
+        filmcraft_engine::pairing::filter_response(&app.session, &grant, id, response);
+    }
+    outcome
+}
+
+fn handle_authorized(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     if matches!(req.method.as_str(), "ui.click" | "ui.move" | "ui.drag" | "ui.scroll" | "ui.key" | "ui.type") && app.synthetic.len() >= MAX_SYNTHETIC_EVENTS {

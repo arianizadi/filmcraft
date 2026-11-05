@@ -489,8 +489,14 @@ fn source_graphics_share_edits() {
     s.execute("timeline.place", json!({"item": item_id, "track": v1.0, "time": Tick::from_seconds_f64(700.0).0})).unwrap();
     let c2 = s.active_sequence().unwrap().video_tracks.iter().flat_map(|t| &t.items).find(|i| i.item.0 == item_id && i.id != c).unwrap().id;
     assert_eq!(texts(&s, c2), vec!["Shared"]);
+    let ids =
+        |s: &Session, cl: ClipId| item(s, cl).effects.iter().filter(|e| filmcraft_project::graphic::is_layer(e)).map(|e| e.instance_id).collect::<Vec<_>>();
+    let placed = (ids(&s, c), ids(&s, c2));
+    assert_ne!(placed.0, placed.1, "shared values still have distinct placed identities");
     s.execute("graphics.setText", json!({"clip": c2.0, "text": "Edited once"})).unwrap();
     assert_eq!(texts(&s, c), vec!["Edited once"], "the other instance follows");
+    assert_eq!((ids(&s, c), ids(&s, c2)), placed, "propagation retains both placed identities");
+    filmcraft_format::decode(&filmcraft_format::encode(&s.project, false)).unwrap();
     s.execute("graphics.set", json!({"clip": c.0, "props": {"size": 60}})).unwrap();
     let size = |s: &Session, cl: ClipId| item(s, cl).effects.iter().find(|e| e.effect == "graphic_text").unwrap().params["size"].value.clone();
     assert_eq!(size(&s, c2), ParamValue::Float(60.0));

@@ -211,7 +211,13 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         // Start the control server before anything touches recovery state: `file.recover`
         // consumes its candidate, and an input-only session that must abort (no server) may not
         // take that step first, or the recovered work is lost (#3436).
-        let control = control_port.map(|port| control_server::start(port, cc.egui_ctx.clone()));
+        let pairings = filmcraft_engine::pairing::Pairings::default();
+        if let Some(dir) = data_dir.clone().or_else(default_data_dir)
+            && let Err(e) = pairings.configure(&dir)
+        {
+            log::warn!("Agent pairing unavailable: {e}");
+        }
+        let control = control_port.map(|port| control_server::start(port, cc.egui_ctx.clone(), pairings.clone()));
         if control_input_only && let Some((_, _, Some(why))) = &control {
             return Err(Box::new(control_server::ControlServerRequired(why.reason())));
         }
@@ -230,6 +236,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             }),
         );
         let mut session = Session::default();
+        session.pairings = pairings;
         if control_port.is_some() {
             session.operations.permission = filmcraft_engine::operations::Permission::Propose;
         }

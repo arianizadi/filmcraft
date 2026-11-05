@@ -56,6 +56,7 @@ impl Default for OperationStore {
 }
 
 struct Record {
+    project_path: Option<String>,
     key: String,
     command: String,
     params: Value,
@@ -77,10 +78,15 @@ pub fn authorize(s: &Session, id: &str, params: &Value) -> Result<()> {
         }
         return authorize(s, inner, params.get("params").unwrap_or(&Value::Null));
     }
-    let allowed = !is_write(id, params)
+    let allowed = id == "agent.pairRequest"
+        || !is_write(id, params)
         || s.operations.permission == Permission::Edit
-        || (s.operations.permission == Permission::Propose && matches!(id, "agent.plan" | "agent.discard"));
+        || (s.operations.permission == Permission::Propose && crate::command_access::is_proposal(id));
     if allowed { Ok(()) } else { Err(crate::EngineError::Other(format!("permission_denied: {id} requires Edit permission in the Agent Review window"))) }
+}
+
+pub fn operation_project(s: &Session, id: &str) -> Option<Option<String>> {
+    s.operations.records.get(id).map(|r| r.project_path.clone())
 }
 
 fn required_string<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
@@ -156,23 +162,32 @@ fn execute(s: &mut Session, p: &Value) -> Result<Value> {
     let before = s.project.clone();
     // Reserve the receipt before running. An unexpected failure cannot make the key reusable.
     let initial = json!({"operationId": operation, "idempotencyKey": key, "sessionId": session,
-        "status": "unknown_commit", "beforeRevision": before_revision, "afterRevision": null,
+        "status": "unknown_commit", "projectPath":s.path, "beforeRevision": before_revision, "afterRevision": null,
         "command": command, "replayed": false});
     s.operations.receipt_bytes = s.operations.receipt_bytes.saturating_add(bytes.len());
     s.operations.order.push(operation.to_string());
     s.operations.keys.insert(key.to_string(), operation.to_string());
     s.operations.records.insert(
         operation.to_string(),
-        Record { key: key.to_string(), command: command.to_string(), params: params.clone(), base_revision: base, receipt: initial },
+        Record {
+            project_path: s.path.clone(),
+            key: key.to_string(),
+            command: command.to_string(),
+            params: params.clone(),
+            base_revision: base,
+            receipt: initial,
+        },
     );
+    let previous_origin = s.command_origin.replace(command.to_string());
     let result = s.execute(command, params);
+    s.command_origin = previous_origin;
     // An unchanged revision proves nothing about external files, jobs, or partial session changes.
     let unchanged_atomic = (crate::agent_plans::eligible_command(command) || matches!(command, "agent.plan" | "agent.apply" | "agent.discard"))
         && before_revision == s.revision
         && *before == *s.project;
     let mut receipt = json!({"operationId": operation, "idempotencyKey": key, "sessionId": session,
         "status": if result.is_ok() { "committed" } else if unchanged_atomic { "failed" } else { "unknown_commit" },
-        "beforeRevision": before_revision, "afterRevision": s.revision, "command": command, "replayed": false});
+        "projectPath":s.path, "beforeRevision": before_revision, "afterRevision": s.revision, "command": command, "replayed": false});
     match crate::agent_plans::project_diff(&before, &s.project) {
         Ok(diff) => receipt["affected"] = diff.get("affected").cloned().unwrap_or(Value::Null),
         Err(e) => receipt["inspectionWarning"] = json!(e.to_string()),

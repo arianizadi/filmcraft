@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+pub mod cdl;
 pub mod grade;
 pub mod log;
 pub mod lut;

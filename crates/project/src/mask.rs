@@ -376,6 +376,9 @@ impl TrackMethod {
 /// A mask on an effect instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mask {
+    /// Source-space pixel alpha; geometric path is retained for older editing tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<crate::AlphaTrack>,
     pub name: String,
     /// `ParamValue::Path`.
     pub path: Param,
@@ -400,6 +403,7 @@ impl Mask {
     pub fn new(name: impl Into<String>, path: MaskPath) -> Self {
         Self {
             name: name.into(),
+            alpha: None,
             path: Param::new(ParamValue::Path(path)),
             feather: Param::new(ParamValue::Float(10.0)),
             opacity: Param::new(ParamValue::Float(100.0)),
@@ -434,7 +438,7 @@ impl Mask {
         }
     }
     pub fn is_animated(&self) -> bool {
-        MASK_PARAMS.iter().any(|p| self.param(p).is_some_and(Param::is_animated))
+        self.alpha.as_ref().is_some_and(|a| a.frames.len() > 1) || MASK_PARAMS.iter().any(|p| self.param(p).is_some_and(Param::is_animated))
     }
     /// Keyframe times of every mask parameter (for the keyframe lane / presets).
     pub fn params_mut(&mut self) -> [&mut Param; 4] {

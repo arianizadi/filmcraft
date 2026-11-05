@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 pub struct Word {
     /// The word as written, with attached punctuation (`"Hello,"`). No surrounding spaces.
     pub text: String,
+    /// Stable source-word identity, unique within this transcript. Zero means legacy/unassigned.
+    #[serde(default)]
+    pub id: u64,
     /// Media time of the word's first sample.
     pub start: Tick,
     /// Media time just after the word (exclusive).
@@ -38,7 +41,7 @@ fn is_one(v: &f32) -> bool {
 
 impl Word {
     pub fn new(text: impl Into<String>, start: Tick, end: Tick) -> Self {
-        Self { text: text.into(), start, end, speaker: None, confidence: 1.0 }
+        Self { text: text.into(), id: 0, start, end, speaker: None, confidence: 1.0 }
     }
     pub fn range(&self) -> TimeRange {
         TimeRange::from_bounds(self.start, self.end.max(self.start))
@@ -72,16 +75,42 @@ pub const MAX_SPEAKERS: u32 = 1024;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Transcript {
-    /// ISO 639-1 code of the spoken language (`"en"`).
+    /// ISO 639 language code (`"en"`; `"mul"` for mixed-language recognition windows).
     pub language: String,
     /// What produced it: a model id (`"whisper-base"`), `"imported"` or `"manual"`.
     pub source: String,
     pub speakers: Vec<Speaker>,
     /// Words in time order, non-overlapping.
     pub words: Vec<Word>,
+    /// High-water identity counter: deleted words never have their IDs reused.
+    pub next_word_id: u64,
 }
 
 impl Transcript {
+    /// Assign legacy/new words while preserving existing IDs through correction and sorting.
+    pub fn ensure_word_ids(&mut self) -> Result<(), String> {
+        if self.next_word_id > u64::MAX / 2 || self.words.iter().any(|w| w.id > u64::MAX / 2) {
+            return Err("source word identity exceeds supported range".into());
+        }
+        if self.words.len() > 1_000_000 {
+            return Err("transcript exceeds one million words".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for word in &self.words {
+            if word.id != 0 && !seen.insert(word.id) {
+                return Err("duplicate source word identity".into());
+            }
+            self.next_word_id = self.next_word_id.max(word.id);
+        }
+        for word in &mut self.words {
+            if word.id == 0 {
+                self.next_word_id = self.next_word_id.checked_add(1).ok_or("source word identities exhausted")?;
+                word.id = self.next_word_id;
+            }
+        }
+        Ok(())
+    }
+
     /// The speaker name of `word` (`"Speaker 2"` when the label list is short; `None` when the word
     /// has no speaker).
     ///
@@ -164,6 +193,58 @@ impl Transcript {
     }
 }
 
+impl crate::Project {
+    /// Keep intentional current identities or uniquely verified source-time/text matches. A
+    /// recognizer's numeric IDs are not project identities and are always discarded first.
+    pub fn prepare_transcript_ids(&self, item: crate::ItemId, t: &mut Transcript, explicit: bool) -> Result<(), String> {
+        let previous = self.transcripts.get(&item);
+        let old_max = previous
+            .map_or(0, |old| old.next_word_id.max(old.words.iter().map(|w| w.id).max().unwrap_or(0)))
+            .max(self.transcript_word_counters.get(&item).copied().unwrap_or(0));
+        let mut matches = std::collections::BTreeMap::new();
+        let mut current_ids = std::collections::BTreeSet::new();
+        if let Some(previous) = previous {
+            for word in &previous.words {
+                if word.id != 0 {
+                    current_ids.insert(word.id);
+                    let key = (word.text.as_str(), word.start, word.end);
+                    matches.entry(key).and_modify(|id| *id = None).or_insert(Some(word.id));
+                }
+            }
+        }
+        let mut used = std::collections::BTreeSet::new();
+        if explicit {
+            for word in &t.words {
+                if word.id != 0 && !used.insert(word.id) {
+                    return Err("duplicate source word identity".into());
+                }
+            }
+        }
+        for word in &mut t.words {
+            if !explicit {
+                word.id = 0;
+            }
+            if word.id != 0 && word.id <= old_max && !current_ids.contains(&word.id) {
+                return Err("source word identity is retired; omit the ID to allocate a new word".into());
+            }
+            if word.id == 0
+                && let Some(Some(id)) = matches.get(&(word.text.as_str(), word.start, word.end))
+                && used.insert(*id)
+            {
+                word.id = *id;
+            }
+        }
+        t.next_word_id = if explicit { t.next_word_id.max(old_max) } else { old_max };
+        t.ensure_word_ids()
+    }
+    pub fn store_transcript(&mut self, item: crate::ItemId, t: Transcript) {
+        let high = t.next_word_id.max(t.words.iter().map(|w| w.id).max().unwrap_or(0));
+        let counter = self.transcript_word_counters.entry(item).or_default();
+        *counter = (*counter).max(high);
+        self.transcripts.insert(item, std::sync::Arc::new(t));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +297,27 @@ mod tests {
         assert_eq!(t.words[0].normalized(), "um");
         assert_eq!(t.words[1].normalized(), "don't");
         assert_eq!(t.text(), "Um, Don't! go");
+    }
+}
+
+#[cfg(test)]
+mod stable_id_tests {
+    use super::*;
+    #[test]
+    fn normalization_and_new_recognition_keep_existing_ids_and_never_reuse_deleted_ids() {
+        let mut t = Transcript { words: vec![Word::new("a", Tick(10), Tick(20)), Word::new("b", Tick(30), Tick(40))], ..Default::default() };
+        t.ensure_word_ids().unwrap();
+        let a = t.words[0].id;
+        let b = t.words[1].id;
+        t.words.reverse();
+        t.normalize();
+        assert_eq!(t.words.iter().map(|w| w.id).collect::<Vec<_>>(), [a, b]);
+        t.words.remove(1);
+        t.words.push(Word::new("c", Tick(30), Tick(40)));
+        t.ensure_word_ids().unwrap();
+        assert_eq!(t.words[0].id, a);
+        assert!(t.words[1].id > b);
+        t.words[1].id = a;
+        assert!(t.ensure_word_ids().is_err());
     }
 }

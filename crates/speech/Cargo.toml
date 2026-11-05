@@ -29,6 +29,7 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 rustls = { version = "0.23", default-features = false, optional = true }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
 sha2 = "0.10"
+chrono = { workspace = true }
 
 [[example]]
 name = "transcribe"

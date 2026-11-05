@@ -66,7 +66,7 @@ fn continuous(a: &TrackItem, b: &TrackItem) -> bool {
         && a.source_out() == b.source_in
         && a.enabled == b.enabled
         && a.gain_db == b.gain_db
-        && a.effects == b.effects
+        && filmcraft_project::effect::same_content(&a.effects, &b.effects)
 }
 
 /// Remove through edits between pieces of the same multi-camera clip showing the same angle,

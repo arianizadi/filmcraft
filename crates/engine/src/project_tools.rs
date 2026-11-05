@@ -787,10 +787,50 @@ pub fn project_subset(p: &Project, keep: &BTreeSet<ItemId>) -> Project {
     out.items.retain(|id, _| keep.contains(id));
     prune(&mut out.root, keep);
     out.transcripts.retain(|id, _| keep.contains(id));
+    out.transcript_word_counters.retain(|id, _| keep.contains(id));
     out.narrations.retain(|id, _| keep.contains(id));
     // a source graphic holds its item's text and metadata: it leaves with that item only
     out.source_graphics.retain(|id, _| keep.contains(id));
     out.search_bins.clear();
+    // Saved pixels and grades belong only to the media/timelines retained in this export.
+    let mut clips = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    let mut looks = BTreeSet::new();
+    for item in out.sequences() {
+        if let ItemKind::Sequence(q) = &item.kind {
+            sequences.insert(item.id);
+            for clip in q.all_tracks().flat_map(|track| &track.items) {
+                clips.insert(clip.id);
+                looks.extend(clip.shared_look);
+            }
+        }
+    }
+    out.color_workflow.gallery.retain(|_, still| {
+        // Every recorded origin must survive; a source shared by two timelines does not make
+        // a still from an excluded timeline part of the selected timeline.
+        (still.item.is_some() || still.sequence.is_some())
+            && still.item.is_none_or(|id| keep.contains(&id))
+            && still.sequence.is_none_or(|id| sequences.contains(&id))
+            && still.clip.is_none_or(|id| clips.contains(&id))
+    });
+    out.color_workflow.versions.retain(|clip, _| clips.contains(clip));
+    // Whole-project snapshots and command labels can contain excluded paths, text and pixels.
+    // They cannot be carried across a selection boundary safely by filtering top-level IDs.
+    out.review.checkpoints.clear();
+    out.review.activity.clear();
+    out.review.annotations.retain(|annotation| sequences.contains(&annotation.sequence));
+    for profile in out.review.profiles.values().flatten().chain(out.review.active_profile_settings.iter()) {
+        if let Some(reference) = profile.reference_look.as_deref() {
+            looks.extend(
+                out.color_workflow
+                    .looks
+                    .values()
+                    .filter(|look| reference.parse::<u64>().ok() == Some(look.id) || look.name.eq_ignore_ascii_case(reference))
+                    .map(|look| look.id),
+            );
+        }
+    }
+    out.color_workflow.looks.retain(|id, _| looks.contains(id));
     out
 }
 

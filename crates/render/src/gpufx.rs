@@ -218,6 +218,7 @@ pub enum FxOp {
         vfeather: f32,
         aspect: f32,
         gpu_capable: bool,
+        extra: Option<Box<crate::lumetri_extra::LumetriExtra>>,
     },
 }
 
@@ -613,7 +614,14 @@ impl FxOp {
 
                 let hsl_on = b(e, "hsl_on");
 
-                let gpu_capable = !is_hdr && !has_input_lut && !has_look_lut && look == 0 && sharpen.abs() <= 1e-3 && !has_curves && !has_wheels && !hsl_on;
+                let extra = (has_curves || has_wheels || hsl_on).then(|| Box::new(crate::lumetri_extra::LumetriExtra::eval(e, cx, w, h)));
+                let gpu_capable = crate::lumetri_extra::valid_inputs(e)
+                    && !is_hdr
+                    && !has_input_lut
+                    && !has_look_lut
+                    && look == 0
+                    && sharpen.abs() <= 1e-3
+                    && extra.as_ref().is_none_or(|v| v.gpu_ok());
 
                 let bf = |id: &str| if basic_on { f(e, id, cx) } else { 0.0 };
                 let temp = bf("temperature") / 100.0;
@@ -657,6 +665,7 @@ impl FxOp {
                     vfeather,
                     aspect,
                     gpu_capable,
+                    extra,
                 }
             }
             _ => return None,
@@ -1062,6 +1071,7 @@ impl FxOp {
                 vround,
                 vfeather,
                 aspect,
+                extra,
                 ..
             } => {
                 let gains = *gains;
@@ -1122,6 +1132,9 @@ impl FxOp {
                     }
                     dec(v)
                 });
+                if let Some(extra) = extra {
+                    extra.apply(img);
+                }
             }
         }
     }

@@ -1,7 +1,7 @@
 //! Typed, revision-guarded access to an explicitly addressed Lumetri instance.
 //!
-//! `effectInstance` is `lumetri:<ordinal>` among the clip's Lumetri instances, matching
-//! `EffectSel`. It is valid at the returned revision, not a persistent project identity.
+//! `effectInstance` prefers persistent `effect:<id>` identities. Legacy `lumetri:<ordinal>`
+//! addresses remain revision-scoped for compatibility; all writes require expectedRevision.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,11 +19,11 @@ const MAX_TARGETS: usize = 256;
 
 pub(crate) fn commands() -> Vec<CommandSpec> {
     [
-        ("grade.get", "Inspect Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"lumetri:0"?}"#, false, get as fn(&mut Session, &Value) -> Result<Value>),
-        ("grade.patch", "Patch Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"lumetri:0"|"new","expectedRevision":n,"params":{id:{"value":ParamValue?,"keyframes":[Keyframe]?}}?,"enabled":bool?,"masks":[Mask]?,"replaceKeyframes":bool=false}"#, true, patch),
-        ("grade.copy", "Copy Grade", r#"{"source":{"clip":id,"sequence":id?,"effectInstance":"lumetri:0"},"targets":[{"clip":id,"sequence":id?,"effectInstance":"lumetri:0"|"new"}],"expectedRevision":n,"replaceKeyframes":bool=false}"#, true, copy),
-        ("grade.reset", "Reset Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"lumetri:0","expectedRevision":n,"params":[id]?,"replaceKeyframes":bool=false}"#, true, reset),
-        ("grade.matchBatch", "Match Shots to Hero", r#"{"reference":{"sequence":id?,"clip":id?,"item":id?,"frames":[n]?},"targets":[{"clip":id,"sequence":id?,"effectInstance":"lumetri:0"|"new","frames":[n]?}],"expectedRevision":n,"mode":"full"|"exposure"|"white_balance"?,"samplesPerClip":n=3,"minConfidence":n=0.25,"skinProtection":bool=true,"replaceKeyframes":bool=false}"#, true, match_batch),
+        ("grade.get", "Inspect Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0"?}"#, false, get as fn(&mut Session, &Value) -> Result<Value>),
+        ("grade.patch", "Patch Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0"|"new","expectedRevision":n,"params":{id:{"value":ParamValue?,"keyframes":[Keyframe]?}}?,"enabled":bool?,"masks":[Mask]?,"replaceKeyframes":bool=false}"#, true, patch),
+        ("grade.copy", "Copy Grade", r#"{"source":{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0"},"targets":[{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0"|"new"}],"expectedRevision":n,"replaceKeyframes":bool=false}"#, true, copy),
+        ("grade.reset", "Reset Grade", r#"{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0","expectedRevision":n,"params":[id]?,"replaceKeyframes":bool=false}"#, true, reset),
+        ("grade.matchBatch", "Match Shots to Hero", r#"{"reference":{"gallery":id|name?,"sequence":id?,"clip":id?,"item":id?,"frames":[n]?},"targets":[{"clip":id,"sequence":id?,"effectInstance":"effect:<id>"|"lumetri:0"|"new","frames":[n]?}],"expectedRevision":n,"mode":"full"|"exposure"|"white_balance"?,"samplesPerClip":n=3,"minConfidence":n=0.25,"skinProtection":bool=true,"replaceKeyframes":bool=false}"#, true, match_batch),
     ].into_iter().map(|(id, label, params, journal, run)| CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: always, run, journal }).collect()
 }
 
@@ -123,27 +123,29 @@ fn resolve(s: &Session, a: &Address, write: bool, cmd: &str) -> Result<Resolved>
         let effect = filmcraft_project::find_effect("lumetri").ok_or_else(|| bad(cmd, "Lumetri definition unavailable"))?.instance();
         (None, it.effects.iter().filter(|e| e.effect == "lumetri").count(), effect)
     } else {
-        let ordinal = a
-            .effect_instance
-            .strip_prefix("lumetri:")
-            .and_then(|i| i.parse::<usize>().ok())
-            .ok_or_else(|| bad(cmd, "`effectInstance` must be `lumetri:<ordinal>` (or `new` when writing)"))?;
-        let (index, effect) = it
-            .effects
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.effect == "lumetri")
-            .nth(ordinal)
-            .ok_or_else(|| bad(cmd, "no such Lumetri instance at this revision"))?;
+        let index = filmcraft_project::effect_ids::find_instance(&it.effects, &a.effect_instance).map_err(|e| bad(cmd, e))?;
+        let effect = it.effects.get(index).ok_or_else(|| bad(cmd, "effect disappeared"))?;
+        if effect.effect != "lumetri" {
+            return Err(bad(cmd, "the addressed effect is not a Lumetri grade"));
+        }
+        let ordinal = it.effects.iter().take(index).filter(|e| e.effect == "lumetri").count();
         (Some(index), ordinal, effect.clone())
     };
     Ok(Resolved { sequence, clip, index, ordinal, duration: it.duration, effect })
 }
 
 fn describe(s: &Session, r: &Resolved) -> Value {
-    json!({"sequence":r.sequence.0,"clip":r.clip.0,"effectInstance":format!("lumetri:{}",r.ordinal),
-        "revision":s.revision,"enabled":r.effect.enabled,"params":r.effect.params,"masks":r.effect.masks,
-        "schema":filmcraft_project::find_effect("lumetri").map(|d| &d.params),"timeUnit":"ticks","keyframeTimeOrigin":"source_media"})
+    let effect = s
+        .project
+        .sequence(r.sequence)
+        .and_then(|q| q.find_item(r.clip))
+        .and_then(|(_, it)| it.effects.iter().filter(|e| e.effect == "lumetri").nth(r.ordinal))
+        .unwrap_or(&r.effect);
+    let legacy = format!("lumetri:{}", r.ordinal);
+    let stable = (effect.instance_id != 0).then(|| format!("effect:{}", effect.instance_id));
+    json!({"sequence":r.sequence.0,"clip":r.clip.0,"effectInstance":stable.as_ref().unwrap_or(&legacy),"effectInstanceId":effect.instance_id,"legacyEffectInstance":legacy,"stableIdentity":stable.is_some(),
+        "revision":s.revision,"enabled":effect.enabled,"params":effect.params,"masks":effect.masks,
+        "schema":filmcraft_project::find_effect("lumetri").map(|d|&d.params),"timeUnit":"ticks","keyframeTimeOrigin":"source_media"})
 }
 
 fn get(s: &mut Session, p: &Value) -> Result<Value> {
@@ -168,7 +170,9 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
                 .map(|r| describe(s, &r))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(json!({"sequence":sequence.0,"clip":p.clip,"revision":s.revision,"instances":instances}))
+    Ok(
+        json!({"sequence":sequence.0,"clip":p.clip,"revision":s.revision,"instances":instances,"sharedLook":it.shared_look,"sharedEffects":s.project.color_workflow.shared_effects(it),"ordering":"shared effects before local per-shot effects"}),
+    )
 }
 
 fn validate_value(s: &Session, value: &ParamValue, def: &ParamDef, cmd: &str) -> Result<()> {
@@ -329,10 +333,12 @@ fn copy(s: &mut Session, p: &Value) -> Result<Value> {
         if !seen.insert((r.sequence, r.clip, r.ordinal)) {
             return Err(bad("grade.copy", "duplicate target instance"));
         }
-        if r.effect != source.effect && r.effect.is_animated() && !p.replace_keyframes {
+        let mut copied = source.effect.clone();
+        copied.instance_id = r.effect.instance_id;
+        if r.effect != copied && r.effect.is_animated() && !p.replace_keyframes {
             return Err(bad("grade.copy", "target is animated; set replaceKeyframes:true before replacing it"));
         }
-        r.effect = source.effect.clone();
+        r.effect = copied;
         validate_effect(s, &r.effect, r.duration, "grade.copy")?;
         targets.push(r);
     }
@@ -377,7 +383,9 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
         if r.effect.is_animated() && !p.replace_keyframes {
             return Err(bad("grade.reset", "animated grade requires replaceKeyframes:true"));
         }
+        let identity = r.effect.instance_id;
         r.effect = defaults;
+        r.effect.instance_id = identity;
     }
     install(s, "Reset Grade", std::slice::from_ref(&r))?;
     Ok(describe(s, &r))
@@ -577,6 +585,7 @@ fn match_batch(s: &mut Session, p: &Value) -> Result<Value> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Reference {
+        gallery: Option<Value>,
         sequence: Option<u64>,
         clip: Option<u64>,
         item: Option<u64>,
@@ -641,39 +650,60 @@ fn match_batch(s: &mut Session, p: &Value) -> Result<Value> {
         let times = sample_times(&q.settings, it.start, it.duration, target.frames.as_deref(), samples)?;
         targets.push((r, times));
     }
-    let mut reference_project = (*s.project).clone();
-    let (ref_seq, ref_clip) = match (p.reference.item, p.reference.clip, p.reference.sequence) {
-        (Some(item), None, None) => {
-            let item = ItemId(item);
-            let source = reference_project.item(item).ok_or_else(|| bad(CMD, "no such reference item"))?;
-            let rate = source.frame_rate();
-            let duration = source.duration();
-            let media = reference_project.resolve_media(item).ok_or_else(|| bad(CMD, "reference item must be media"))?.1;
-            let video = media.info.video.as_ref().ok_or_else(|| bad(CMD, "reference item has no picture"))?;
-            let settings = filmcraft_project::SequenceSettings { width: video.width, height: video.height, frame_rate: rate, ..Default::default() };
-            settings.validate().map_err(|e| bad(CMD, e.to_string()))?;
-            if duration <= Tick::ZERO || duration > Tick::MAX {
-                return Err(bad(CMD, "reference media duration is invalid"));
-            }
-            let sequence = reference_project.new_sequence("Match Reference", settings, 1, 0, None);
-            let clip = reference_project
-                .make_track_item(item, TrackKind::Video, Tick::ZERO, filmcraft_time::TimeRange::new(Tick::ZERO, duration), rate)
-                .ok_or_else(|| bad(CMD, "could not address reference media"))?;
-            let id = clip.id;
-            let q = reference_project.sequence_mut(sequence).ok_or_else(|| bad(CMD, "could not address reference sequence"))?;
-            q.video_tracks.first_mut().ok_or_else(|| bad(CMD, "reference track unavailable"))?.items.push(clip);
-            (sequence, id)
+    let (reference, reference_times, reference_metadata) = if let Some(gallery) = &p.reference.gallery {
+        if p.reference.item.is_some() || p.reference.clip.is_some() || p.reference.sequence.is_some() || p.reference.frames.is_some() {
+            return Err(bad(CMD, "gallery reference cannot be combined with live source or frame selectors"));
         }
-        (None, Some(clip), sequence) => (sequence.map(ItemId).or(s.state.active_sequence).ok_or_else(|| bad(CMD, "reference needs a sequence"))?, ClipId(clip)),
-        _ => return Err(bad(CMD, "reference must address either a media `item`, or a timeline `clip` with optional `sequence`")),
+        let id = crate::color_library::gallery_id(s, &json!({"still":gallery}), "still", CMD)?;
+        let still = s.project.color_workflow.gallery.get(&id).ok_or_else(|| bad(CMD, "gallery still missing"))?;
+        still.reference.validate().map_err(|e| bad(CMD, e))?;
+        if !still.pipeline.is_plain() {
+            return Err(bad(CMD, "gallery matching currently requires an SDR Rec.709 captured reference"));
+        }
+        (
+            filmcraft_render::Image { w: still.reference.width, h: still.reference.height, px: still.reference.pixels.to_vec() },
+            vec![still.time],
+            json!({"gallery":id,"name":still.name,"capturedRevision":still.revision,"frame":still.frame,"immutable":true}),
+        )
+    } else {
+        let mut reference_project = (*s.project).clone();
+        let (ref_seq, ref_clip) = match (p.reference.item, p.reference.clip, p.reference.sequence) {
+            (Some(item), None, None) => {
+                let item = ItemId(item);
+                let source = reference_project.item(item).ok_or_else(|| bad(CMD, "no such reference item"))?;
+                let rate = source.frame_rate();
+                let duration = source.duration();
+                let media = reference_project.resolve_media(item).ok_or_else(|| bad(CMD, "reference item must be media"))?.1;
+                let video = media.info.video.as_ref().ok_or_else(|| bad(CMD, "reference item has no picture"))?;
+                let settings = filmcraft_project::SequenceSettings { width: video.width, height: video.height, frame_rate: rate, ..Default::default() };
+                settings.validate().map_err(|e| bad(CMD, e.to_string()))?;
+                if duration <= Tick::ZERO || duration > Tick::MAX {
+                    return Err(bad(CMD, "reference media duration is invalid"));
+                }
+                let sequence = reference_project.new_sequence("Match Reference", settings, 1, 0, None);
+                let clip = reference_project
+                    .make_track_item(item, TrackKind::Video, Tick::ZERO, filmcraft_time::TimeRange::new(Tick::ZERO, duration), rate)
+                    .ok_or_else(|| bad(CMD, "could not address reference media"))?;
+                let id = clip.id;
+                let q = reference_project.sequence_mut(sequence).ok_or_else(|| bad(CMD, "could not address reference sequence"))?;
+                q.video_tracks.first_mut().ok_or_else(|| bad(CMD, "reference track unavailable"))?.items.push(clip);
+                (sequence, id)
+            }
+            (None, Some(clip), sequence) => {
+                (sequence.map(ItemId).or(s.state.active_sequence).ok_or_else(|| bad(CMD, "reference needs a sequence"))?, ClipId(clip))
+            }
+            _ => return Err(bad(CMD, "reference must address either a media `item`, or a timeline `clip` with optional `sequence`")),
+        };
+        let q = reference_project.sequence(ref_seq).ok_or_else(|| bad(CMD, "no such reference sequence"))?;
+        let (_, it) = q.find_item(ref_clip).ok_or_else(|| bad(CMD, "no such reference clip"))?;
+        let reference_times = sample_times(&q.settings, it.start, it.duration, p.reference.frames.as_deref(), samples)?;
+        if targets.iter().any(|(r, _)| r.sequence == ref_seq && r.clip == ref_clip && p.reference.item.is_none()) {
+            return Err(bad(CMD, "a target cannot be its own hero reference"));
+        }
+        let reference = sample_atlas(s, &reference_project, ref_seq, ref_clip, &reference_times)?;
+        let metadata = p.reference.item.map(|item| json!({"item":item})).unwrap_or_else(|| json!({"sequence":ref_seq.0,"clip":ref_clip.0}));
+        (reference, reference_times, metadata)
     };
-    let q = reference_project.sequence(ref_seq).ok_or_else(|| bad(CMD, "no such reference sequence"))?;
-    let (_, it) = q.find_item(ref_clip).ok_or_else(|| bad(CMD, "no such reference clip"))?;
-    let reference_times = sample_times(&q.settings, it.start, it.duration, p.reference.frames.as_deref(), samples)?;
-    if targets.iter().any(|(r, _)| r.sequence == ref_seq && r.clip == ref_clip && p.reference.item.is_none()) {
-        return Err(bad(CMD, "a target cannot be its own hero reference"));
-    }
-    let reference = sample_atlas(s, &reference_project, ref_seq, ref_clip, &reference_times)?;
     let reference_stats = filmcraft_render::color_match::stats(&reference, skin);
     let mut reports = Vec::new();
     let mut accepted = Vec::new();
@@ -743,8 +773,16 @@ fn match_batch(s: &mut Session, p: &Value) -> Result<Value> {
     if !accepted.is_empty() {
         install(s, "Match Shots to Hero", &accepted)?;
     }
+    for report in &mut reports {
+        if let Some(r) = accepted.iter().find(|r| report["clip"].as_u64() == Some(r.clip.0) && report["sequence"].as_u64() == Some(r.sequence.0)) {
+            let actual = describe(s, r);
+            report["effectInstance"] = actual["effectInstance"].clone();
+            report["effectInstanceId"] = actual["effectInstanceId"].clone();
+            report["legacyEffectInstance"] = actual["legacyEffectInstance"].clone();
+        }
+    }
     Ok(
-        json!({"beforeRevision":before_revision,"afterRevision":s.revision,"matched":accepted.len(),"skipped":reports.len().saturating_sub(accepted.len()),"reference":p.reference.item.map(|item|json!({"item":item})).unwrap_or_else(||json!({"sequence":ref_seq.0,"clip":ref_clip.0})),"referenceTimes":reference_times.iter().map(|t|t.0).collect::<Vec<_>>(),"referenceStats":stats_json(&reference_stats),"results":reports,"timeUnit":"ticks","sampleTimeOrigin":"sequence","colorSpace":"linear-rec709"}),
+        json!({"beforeRevision":before_revision,"afterRevision":s.revision,"matched":accepted.len(),"skipped":reports.len().saturating_sub(accepted.len()),"reference":reference_metadata,"referenceTimes":reference_times.iter().map(|t|t.0).collect::<Vec<_>>(),"referenceStats":stats_json(&reference_stats),"results":reports,"timeUnit":"ticks","sampleTimeOrigin":"sequence","colorSpace":"linear-rec709"}),
     )
 }
 
@@ -788,7 +826,8 @@ mod tests {
     fn typed_partial_patch_preserves_other_controls_masks_and_animation() {
         let (mut s, clip, _) = fixture();
         let effect = add(&mut s, clip);
-        assert_eq!(effect["effectInstance"], "lumetri:0");
+        assert_eq!(effect["legacyEffectInstance"], "lumetri:0");
+        assert!(effect["effectInstance"].as_str().unwrap().starts_with("effect:"));
         let duration = s.active_sequence().unwrap().find_item(ClipId(clip)).unwrap().1.duration;
         let keys = vec![Keyframe::new(Tick::ZERO, ParamValue::Float(0.5)), Keyframe::new(duration, ParamValue::Float(1.0))];
         let masks = vec![Mask::new("Face", filmcraft_project::MaskPath::rect(0.0, 0.0, 20.0, 20.0))];

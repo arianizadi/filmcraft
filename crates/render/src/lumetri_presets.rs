@@ -32,6 +32,7 @@ impl LumetriPreset {
             Some(def) => def.instance(),
             // A bare instance named after the effect; the preset's parameters are added below.
             None => EffectInstance {
+                instance_id: 0,
                 effect: "lumetri".into(),
                 enabled: true,
                 params: Default::default(),

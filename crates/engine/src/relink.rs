@@ -475,14 +475,23 @@ pub fn auto_relink(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"relinked": rows, "failed": failed, "remaining": s.offline.missing.iter().map(|i| i.0).collect::<Vec<_>>()}))
 }
 
-/// Files under `root` by lower-case file name (breadth-first, at most `limit` files).
+/// Files under `root` by lower-case name, bounded by file count, 64 levels and 100,000 entries.
 pub fn index_folder(root: &Path, limit: usize) -> BTreeMap<String, Vec<PathBuf>> {
     let mut out: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    if limit == 0 {
+        return out;
+    }
+    let entry_budget = limit.saturating_mul(8).clamp(8, 100_000);
+    let mut visited = 0usize;
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut n = 0;
-    while let Some(d) = queue.pop_front() {
+    while let Some((d, depth)) = queue.pop_front() {
+        if visited >= entry_budget {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        let mut entries: Vec<_> = rd.take(entry_budget.saturating_sub(visited)).filter_map(|e| e.ok()).collect();
+        visited = visited.saturating_add(entries.len());
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
@@ -496,7 +505,9 @@ pub fn index_folder(root: &Path, limit: usize) -> BTreeMap<String, Vec<PathBuf>>
             // budget and walk an unrelated tree. Symlinked files are still candidates.
             let is_file = if file_type.is_symlink() { std::fs::metadata(&p).is_ok_and(|m| m.is_file()) } else { file_type.is_file() };
             if file_type.is_dir() {
-                queue.push_back(p);
+                if depth < 64 {
+                    queue.push_back((p, depth + 1));
+                }
             } else if is_file {
                 out.entry(name.to_ascii_lowercase()).or_default().push(p);
                 n += 1;

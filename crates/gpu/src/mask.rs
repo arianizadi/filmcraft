@@ -74,7 +74,26 @@ impl GpuMask {
         if active.is_empty() || w == 0 || h == 0 {
             return None;
         }
-        let n = w * h;
+        let n = w.checked_mul(h).filter(|n| *n <= filmcraft_render::Image::MAX_PIXELS)?;
+        if active.iter().any(|m| m.alpha.is_some()) {
+            let coverage = filmcraft_render::mask::coverage(masks, w, h)?;
+            let pixels = if let Some((original, effected)) = mix {
+                if original.len() != n.checked_mul(4)? || effected.len() != original.len() {
+                    return None;
+                }
+                original
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(effected.as_chunks::<4>().0)
+                    .zip(&coverage)
+                    .flat_map(|((a, b), &c)| std::array::from_fn::<_, 4, _>(|i| a[i] + (b[i] - a[i]) * c))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return Some((coverage, pixels));
+        }
         if let Some((o, e)) = mix
             && (o.len() != n * 4 || e.len() != n * 4)
         {

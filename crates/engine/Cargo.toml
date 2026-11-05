@@ -11,6 +11,7 @@ workspace = true
 
 [features]
 default = []
+vision = ["filmcraft-vision/clip", "speech-download"]
 # Speech-to-text with Whisper (candle, CPU). Off by default and in wasm builds.
 whisper = ["filmcraft-speech/whisper"]
 # Speech-model downloads over HTTPS.
@@ -20,6 +21,7 @@ neural-voices = ["filmcraft-tts/kokoro", "speech-download"]
 
 [dependencies]
 base64 = "0.23"
+subtle = "2.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 filmcraft-time = { workspace = true }
 filmcraft-geom = { workspace = true }
@@ -39,17 +41,23 @@ filmcraft-format = { workspace = true }
 filmcraft-interchange = { workspace = true }
 filmcraft-captions = { workspace = true }
 filmcraft-speech = { workspace = true }
+filmcraft-vision = { workspace = true }
 filmcraft-tts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+roxmltree = { workspace = true }
 chrono = { workspace = true }
 craft-docpath = { workspace = true }
 web-time = "1"
 
 [dev-dependencies]
+filmcraft-platform = { workspace = true }
 filmcraft-testkit = { workspace = true }
 filmcraft-dng = { workspace = true, features = ["writer"] }
 filmcraft-isobmff = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+same-file = "1.0.6"

@@ -576,3 +576,18 @@ fn edl_media_relinked_at(fps: i64, rate: FrameRate) {
     assert_eq!(frame_rgba(&mut s, 6, 1.0).2, frame_rgba(&mut next_to_media, 6, 1.0).2, "same picture at {fps} fps");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn directory_search_bounds_empty_trees_and_zero_file_budget() {
+    let root = tmp_dir("relink-empty-bounded");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..16 {
+        let child = root.join(format!("empty{index:02}"));
+        std::fs::create_dir_all(child.join("deeper")).unwrap();
+        std::fs::write(child.join("deeper/late.mov"), b"test").unwrap();
+    }
+    assert!(crate::relink::index_folder(&root, 0).is_empty());
+    assert!(crate::relink::index_folder(&root, 1).is_empty(), "entry budget stops expansion before deeper media");
+    assert_eq!(crate::relink::index_folder(&root, 100).values().map(Vec::len).sum::<usize>(), 16);
+    std::fs::remove_dir_all(root).unwrap();
+}

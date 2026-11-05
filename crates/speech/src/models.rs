@@ -243,7 +243,66 @@ pub type DownloadProgress<'a> = &'a mut dyn FnMut(u64, u64, &str) -> bool;
 /// verifier.
 #[cfg(feature = "download")]
 pub fn download(models_dir: &Path, m: &ModelInfo, progress: DownloadProgress) -> Result<(), crate::SpeechError> {
-    download_files(&model_dir(models_dir, m), m.files, progress)
+    download_files(&model_dir(models_dir, m), m.files, progress)?;
+    write_metadata(&model_dir(models_dir, m), m)
+}
+
+/// Record licenses and attribution for an installed package without replacing user files.
+pub fn write_metadata(dir: &Path, model: &ModelInfo) -> Result<(), crate::SpeechError> {
+    use std::io::{Read, Write};
+    let bad = |message: String| crate::SpeechError::Model(message);
+    let install = |name: &str, bytes: &[u8]| -> Result<(), crate::SpeechError> {
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = std::fs::File::open(&path)?;
+                if file.metadata()?.len() > 65536 {
+                    return Err(bad(format!("{}: existing metadata preserved", path.display())));
+                }
+                let mut existing = Vec::new();
+                std::io::Read::take(file, 65537).read_to_end(&mut existing)?;
+                // Attribution dates reflect first installation; the pinned content must agree.
+                if existing == bytes
+                    || (name.ends_with(".attribution")
+                        && existing.starts_with(b"# FilmCraft Whisper artifact\n")
+                        && model.files.iter().any(|f| name == format!("{}.attribution", f.name) && String::from_utf8_lossy(&existing).contains(f.sha256)))
+                {
+                    Ok(())
+                } else {
+                    Err(bad(format!("{}: existing metadata preserved; contents differ", path.display())))
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    };
+    let mit = include_str!("../../../LICENSE-MIT").replace("Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors", "Copyright (c) 2022 OpenAI");
+    install("LICENSE-OpenAI-MIT.txt", mit.as_bytes())?;
+    install("LICENSE-HF-Apache-2.0.txt", include_bytes!("../../../LICENSE-APACHE"))?;
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| bad(e.to_string()))?.as_secs();
+    let date = i64::try_from(seconds)
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .ok_or_else(|| bad("model metadata date is outside supported range".into()))?
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut index = String::from("# FilmCraft local Whisper artifacts\n\n| Asset | Author | License | Source | SHA-256 |\n|---|---|---|---|---|\n");
+    for file in model.files {
+        if !valid_name(file.name) {
+            return Err(bad("invalid model artifact filename".into()));
+        }
+        let attribution = format!(
+            "# FilmCraft Whisper artifact\nasset:        {}\ntitle:        {} model artifact\nauthor:       OpenAI\nsource:       {}\nlicense:      {}\nlicense-file: LICENSE-OpenAI-MIT.txt; LICENSE-HF-Apache-2.0.txt\nadded:        {date} by FilmCraft local model installer\nnotes:        Pinned SHA-256 {}; {} bytes; explicit local model download opt-in\n",
+            file.name, model.name, file.url, model.license, file.sha256, file.size
+        );
+        install(&format!("{}.attribution", file.name), attribution.as_bytes())?;
+        index.push_str(&format!("| {} | OpenAI | {} | {} | {} |\n", file.name, model.license, file.url, file.sha256));
+    }
+    install("ATTRIBUTION.md", index.as_bytes())
 }
 
 /// [`download`] for any pinned file list (the neural voices use it too): missing files of
@@ -252,7 +311,7 @@ pub fn download(models_dir: &Path, m: &ModelInfo, progress: DownloadProgress) ->
 #[cfg(feature = "download")]
 pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgress) -> Result<(), crate::SpeechError> {
     use crate::SpeechError;
-    use std::io::{Read, Write};
+    use std::io::Write;
     if let Some(file) = files.iter().find(|file| !valid_name(file.name)) {
         return Err(SpeechError::Download(format!("invalid model artifact name: {:?}", file.name)));
     }
@@ -270,26 +329,19 @@ pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgres
         let mut body = resp.into_body();
         let mut reader = body.as_reader();
         let mut out = std::io::BufWriter::new(std::fs::File::create(&part)?);
-        let mut hasher = sha2::Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut got = 0u64;
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| SpeechError::Download(format!("{}: {e}", f.name)))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])?;
-            got += n as u64;
-            if !progress(done + got, total, f.name) {
-                drop(out);
-                let _ = std::fs::remove_file(&part);
-                return Err(SpeechError::Cancelled);
-            }
-        }
-        out.flush()?;
+        let copied = copy_download(&mut reader, &mut out, f.size, &mut |got| progress(done.saturating_add(got), total, f.name));
+        let flushed = out.flush();
         drop(out);
-        let sha: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let (got, sha) = match copied.and_then(|v| {
+            flushed?;
+            Ok(v)
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                return Err(e);
+            }
+        };
         if sha != f.sha256 || got != f.size {
             let _ = std::fs::remove_file(&part);
             return Err(SpeechError::Download(format!("{}: checksum mismatch (got {sha}, {got} bytes; expected {}, {} bytes)", f.name, f.sha256, f.size)));
@@ -298,6 +350,38 @@ pub fn download_files(dir: &Path, files: &[ModelFile], progress: DownloadProgres
         done += f.size;
     }
     Ok(())
+}
+
+/// Copy a response with a hard byte ceiling before writing each chunk. A bad server cannot
+/// exhaust the user's disk and only then fail the final checksum/size comparison.
+#[cfg(feature = "download")]
+fn copy_download(
+    reader: &mut impl std::io::Read,
+    out: &mut impl std::io::Write,
+    expected: u64,
+    progress: &mut dyn FnMut(u64) -> bool,
+) -> Result<(u64, String), crate::SpeechError> {
+    use crate::SpeechError;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut got = 0u64;
+    loop {
+        if !progress(got) {
+            return Err(SpeechError::Cancelled);
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let next = got
+            .checked_add(n as u64)
+            .filter(|n| *n <= expected)
+            .ok_or_else(|| SpeechError::Download(format!("response exceeds the declared {expected}-byte model artifact; download stopped")))?;
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        got = next;
+    }
+    Ok((got, format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(feature = "download")]
@@ -319,6 +403,40 @@ fn agent() -> ureq::Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn oversized_and_cancelled_downloads_stop_before_excess_bytes_reach_disk() {
+        let mut output = Vec::new();
+        let mut response = std::io::Cursor::new(vec![1u8; 2_100_000]);
+        assert!(copy_download(&mut response, &mut output, 1_048_580, &mut |_| true).is_err());
+        assert_eq!(output.len(), 1_048_576);
+        output.clear();
+        let mut response = std::io::Cursor::new(b"abc");
+        let (got, sha) = copy_download(&mut response, &mut output, 3, &mut |_| true).unwrap();
+        assert_eq!(got, 3);
+        assert_eq!(output, b"abc");
+        assert_eq!(sha, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        output.clear();
+        let mut response = std::io::Cursor::new(vec![0u8; 2_000_000]);
+        assert!(matches!(copy_download(&mut response, &mut output, 2_000_000, &mut |done| done < 1_048_576), Err(crate::SpeechError::Cancelled)));
+        assert_eq!(output.len(), 1_048_576);
+    }
+    #[test]
+    fn installed_model_metadata_is_complete_repeatable_and_preserves_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = find(DEFAULT_MODEL).unwrap();
+        write_metadata(dir.path(), m).unwrap();
+        write_metadata(dir.path(), m).unwrap();
+        for f in m.files {
+            let text = std::fs::read_to_string(dir.path().join(format!("{}.attribution", f.name))).unwrap();
+            assert!(text.contains(f.sha256) && text.contains(f.url));
+        }
+        let path = dir.path().join("ATTRIBUTION.md");
+        std::fs::write(&path, "user notes").unwrap();
+        assert!(write_metadata(dir.path(), m).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user notes");
+    }
 
     #[test]
     fn catalogue_is_pinned_and_checksummed() {

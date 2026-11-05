@@ -208,7 +208,7 @@ fn simple_transition(id: &str) -> bool {
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
 /// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
 /// with effects off). None: the clip is rendered on the CPU.
-fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
+fn gpu_chain<'a>(project: &'a Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media || item.has_opacity_masks() {
         return None;
@@ -217,7 +217,7 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         return Some(Vec::new());
     }
     let mut chain = Vec::new();
-    for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+    for e in crate::standard_effects(project, item) {
         if !e.enabled {
             continue;
         }
@@ -412,7 +412,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
     if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
         && nest < crate::MAX_NEST_DEPTH
         && let Some(angle) = item.multicam_angle(nested)
-        && !(opts.effects && item.has_standard_effects())
+        && !(opts.effects && crate::has_standard_effects(project, item))
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
         && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), Some(nested.settings.par), mt))
         && let Some(tr) = nested.angle_video_track_index(angle).and_then(|i| nested.video_tracks.get(i))
@@ -432,7 +432,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
     if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
         && nest < crate::MAX_NEST_DEPTH
         && item.multicam_angle(nested).is_none()
-        && !(opts.effects && item.has_standard_effects())
+        && !(opts.effects && crate::has_standard_effects(project, item))
         && !item.has_opacity_masks()
         && bl == Blend::Normal
         && extra_opacity * op >= 1.0 - 1e-6
@@ -456,7 +456,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
     }
     // Graphic clips without standard effects: the layers are rasterised (cached) into one tight
     // image the GPU places as a layer.
-    if !(opts.effects && item.has_standard_effects() || item.has_opacity_masks())
+    if !(opts.effects && crate::has_standard_effects(project, item) || item.has_opacity_masks())
         && project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Graphic { .. }))
     {
         let Some(size) = crate::source_size(project, item.item) else { return };

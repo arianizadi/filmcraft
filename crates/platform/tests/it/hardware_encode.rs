@@ -229,7 +229,7 @@ fn declines_what_the_hardware_path_does_not_take() {
     declined(&ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..ok.clone() }, "two-pass VBR");
     declined(&ExportSettings { bitrate_mode: BitrateMode::Crf, ..ok.clone() }, "CRF");
     declined(&ExportSettings { h264_pass: H264Pass::First, ..ok.clone() }, "an analysis pass");
-    declined(&ExportSettings { signal: filmcraft_export::ColorSignal::PQ, ..ok.clone() }, "HDR");
+    declined(&ExportSettings { signal: filmcraft_export::ColorSignal::PQ, ..ok.clone() }, "HDR H.264");
     declined(&ExportSettings { pixel_aspect: Some((4, 3)), ..ok.clone() }, "non-square pixels");
     declined(&ExportSettings { format: Format::MxfOp1a, ..ok.clone() }, "MXF");
     assert!(config_for(W, H, FrameRate { num: 0, den: 1 }, &ok).is_err());
@@ -532,7 +532,10 @@ fn hevc_declines_what_the_hardware_path_does_not_take() {
     assert_eq!((config.profile, config.keyframe_interval, config.rate), (VtProfile::HevcMain, 30, VtRate::Vbr { target_kbps: 6000, max_kbps: 9000 }));
     let declined = |s: &ExportSettings, what: &str| assert!(config_for(W, H, FPS, s).is_err(), "{what} must not use the hardware encoder");
     declined(&ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..ok.clone() }, "two-pass VBR");
-    declined(&ExportSettings { signal: filmcraft_export::ColorSignal::PQ, ..ok.clone() }, "HDR");
+    for (signal, profile) in [(filmcraft_export::ColorSignal::PQ, VtProfile::HevcMain10Pq), (filmcraft_export::ColorSignal::HLG, VtProfile::HevcMain10Hlg)] {
+        let config = config_for(W, H, FPS, &ExportSettings { signal, ..ok.clone() }).expect("Main 10 configuration");
+        assert_eq!(config.profile, profile);
+    }
     declined(&ExportSettings { pixel_aspect: Some((4, 3)), ..ok.clone() }, "non-square pixels");
     assert!(config_for(321, 181, FPS, &ok).is_err() && config_for(640, 361, FPS, &ok).is_err(), "odd sizes");
     assert!(config_for(W, H, FrameRate { num: 0, den: 1 }, &ok).is_err());

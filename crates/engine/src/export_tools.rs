@@ -510,6 +510,7 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
 pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+    crate::export_safety::preflight(s, &project, seq, &settings)?;
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
@@ -522,8 +523,8 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         let _ = std::fs::create_dir_all(dir);
     }
     write_sidecar(s, &project, seq, &settings)?;
-    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
-    let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, label)?;
+    let id = job.id;
     // Export always renders full-resolution media, whatever the proxy toggle says, from its own
     // copies of the files so the monitors keep their decoders.
     let provider = s.media.full_res_provider(project.clone(), s.services.clone()).own_sources().recording();
@@ -546,12 +547,12 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
         }
         *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     if wait || cfg!(target_arch = "wasm32") {
         run();
     } else {
-        std::thread::Builder::new().name("filmcraft-export".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-export", run)?;
     }
     Ok(id)
 }

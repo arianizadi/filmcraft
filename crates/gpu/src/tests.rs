@@ -696,3 +696,31 @@ fn accumulator_readback_retires_rejected_native_map() {
         "cleanup attempted to unmap an already rejected mapping"
     );
 }
+
+#[test]
+fn segmented_alpha_coverage_and_mix_use_identical_cpu_fallback() {
+    let Some((device, queue)) = device() else {
+        return;
+    };
+    use filmcraft_project::{AlphaFrame, AlphaTrack, Mask, MaskPath, ParamValue};
+    let mut mask = Mask::new("original segmented test", MaskPath::default());
+    mask.feather.value = ParamValue::Float(0.0);
+    mask.alpha = Some(AlphaTrack {
+        source_width: 12,
+        source_height: 12,
+        end: filmcraft_time::Tick(10),
+        method: "original test".into(),
+        provenance: "synthetic alpha with a hole".into(),
+        frames: vec![AlphaFrame::encode(filmcraft_time::Tick::ZERO, 3, 3, &[255, 255, 255, 255, 0, 255, 255, 255, 255], 1.0, false, false).unwrap()],
+    });
+    let masks = filmcraft_render::mask::prepare(&[mask], filmcraft_time::Tick::ZERO, 1.0);
+    let gpu = crate::GpuMask::new(&device, &queue);
+    let coverage = filmcraft_render::mask::coverage(&masks, 12, 12).unwrap();
+    assert_eq!(coverage, gpu.coverage(&masks, 12, 12).unwrap());
+    let original = filmcraft_render::Image::filled(12, 12, [0.1, 0.2, 0.3, 1.0]);
+    let mut expected = filmcraft_render::Image::filled(12, 12, [1.0, 0.5, 0.0, 1.0]);
+    let actual = gpu.mix(&masks, 12, 12, &original.px, &expected.px).unwrap();
+    filmcraft_render::mask::mix(&mut expected, &original, &coverage);
+    assert_eq!(actual, expected.px);
+    assert!(gpu.coverage(&masks, usize::MAX, 2).is_none());
+}

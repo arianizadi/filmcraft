@@ -274,6 +274,9 @@ pub fn clip_loudness(item: &TrackItem, sr: u32, sources: &dyn SourceProvider) ->
     let mut meter = LoudnessMeter::new(sr as f64, if mono { 1 } else { 2 });
     let mut pos = a0;
     while pos < a1 {
+        if filmcraft_media::cancel::cancelled() {
+            return None;
+        }
         let n = (a1 - pos).min(sr as i64) as usize;
         let [l, r] = filmcraft_render::audio::clip_signal(item, pos, n, sr, sources)?;
         if mono {

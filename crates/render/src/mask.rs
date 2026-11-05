@@ -24,6 +24,7 @@ use filmcraft_project::{EffectInstance, Mask, MaskMode};
 use filmcraft_time::Tick;
 use rayon::prelude::*;
 
+pub use crate::alpha_mask::RasterCoverage;
 use crate::image::Image;
 
 /// Flattening tolerance in working pixels.
@@ -32,6 +33,8 @@ pub const FLATTEN_TOLERANCE: f64 = 0.05;
 /// One mask ready for rasterizing, in working-image pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlatMask {
+    /// Actual source alpha when this is a segmented subject mask.
+    pub alpha: Option<RasterCoverage>,
     /// Closed polygon (last vertex connects to the first).
     pub pts: Vec<[f32; 2]>,
     pub feather: f32,
@@ -52,6 +55,7 @@ pub fn prepare(masks: &[Mask], t: Tick, px_scale: f32) -> Vec<FlatMask> {
             let path = m.path_at(t);
             let pts = path.flatten(FLATTEN_TOLERANCE / s.max(1e-6)).into_iter().map(|p| [(p.x * s) as f32, (p.y * s) as f32]).collect();
             FlatMask {
+                alpha: m.alpha.as_ref().map(|a| RasterCoverage::prepare(a, t, px_scale)),
                 pts,
                 feather: (m.feather.f64_at(t).max(0.0) * s) as f32,
                 expansion: (m.expansion.f64_at(t) * s) as f32,
@@ -97,6 +101,12 @@ fn mask_row(m: &FlatMask, y: usize, out: &mut [f32]) {
         let c = falloff(sd + m.expansion, m.feather);
         m.opacity * if m.inverted { 1.0 - c } else { c }
     };
+    if let Some(alpha) = &m.alpha {
+        for (x, pixel) in out.iter_mut().enumerate() {
+            *pixel = value(alpha.signed_at(x as f32 + 0.5, py));
+        }
+        return;
+    }
     if n < 3 {
         out.fill(value(-b));
         return;
@@ -143,7 +153,10 @@ fn mask_row(m: &FlatMask, y: usize, out: &mut [f32]) {
 pub fn coverage(masks: &[FlatMask], w: usize, h: usize) -> Option<Vec<f32>> {
     let first = masks.iter().find(|m| m.mode != MaskMode::None)?;
     let start = first.mode.start();
-    let mut acc = vec![start; w * h];
+    let length = w.checked_mul(h).filter(|n| *n <= Image::MAX_PIXELS)?;
+    let mut acc = Vec::new();
+    acc.try_reserve_exact(length).ok()?;
+    acc.resize(length, start);
     if w == 0 {
         return Some(acc);
     }
@@ -214,6 +227,12 @@ pub fn coverage_at(masks: &[FlatMask], x: f32, y: f32) -> Option<f32> {
     let first = masks.iter().find(|m| m.mode != MaskMode::None)?;
     let mut acc = first.mode.start();
     for m in masks.iter().filter(|m| m.mode != MaskMode::None) {
+        if let Some(alpha) = &m.alpha {
+            let c = falloff(alpha.signed_at(x, y) + m.expansion, m.feather);
+            let v = m.opacity * if m.inverted { 1.0 - c } else { c };
+            acc = m.mode.combine(acc, v).clamp(0.0, 1.0);
+            continue;
+        }
         let n = m.pts.len();
         let mut wind = 0;
         let mut d2 = f32::INFINITY;
@@ -321,5 +340,36 @@ mod tests {
                 assert!((r - c[y * w + x]).abs() < 1e-5, "({x},{y}) {r} vs {}", c[y * w + x]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+    use filmcraft_project::{AlphaFrame, AlphaTrack, MaskPath, ParamValue};
+    #[test]
+    fn raster_coverage_preserves_holes_feather_inversion_and_failed_transparency() {
+        let mut mask = Mask::new("pixel alpha", MaskPath::default());
+        mask.feather.value = ParamValue::Float(0.0);
+        mask.alpha = Some(AlphaTrack {
+            source_width: 30,
+            source_height: 30,
+            end: Tick(10),
+            method: "test".into(),
+            provenance: "original test".into(),
+            frames: vec![AlphaFrame::encode(Tick::ZERO, 3, 3, &[255, 255, 255, 255, 0, 255, 255, 255, 255], 1.0, false, false).unwrap()],
+        });
+        let prepared = prepare(&[mask.clone()], Tick::ZERO, 1.0);
+        let values = coverage(&prepared, 30, 30).unwrap();
+        assert_eq!(values[15 * 30 + 15], 0.0);
+        assert_eq!(values[5 * 30 + 5], 1.0);
+        assert_eq!(coverage_at(&prepared, 15.5, 15.5).unwrap(), 0.0);
+        mask.inverted = true;
+        let inverted = coverage(&prepare(&[mask.clone()], Tick::ZERO, 1.0), 30, 30).unwrap();
+        assert_eq!(inverted[15 * 30 + 15], 1.0);
+        mask.inverted = false;
+        mask.alpha.as_mut().unwrap().frames[0].failed = true;
+        assert!(coverage(&prepare(&[mask], Tick::ZERO, 1.0), 30, 30).unwrap().iter().all(|v| *v == 0.0));
+        assert!(coverage(&prepared, usize::MAX, 2).is_none());
     }
 }

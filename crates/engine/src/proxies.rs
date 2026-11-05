@@ -269,8 +269,8 @@ fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, ReservedOutput, 
         total += frame_count(&clip, None);
         tasks.push((item, clip, name, src, output, pr));
     }
-    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
-    let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, label)?;
+    let id = job.id;
     job.progress.total.store(total, std::sync::atomic::Ordering::Relaxed);
     let outputs: Arc<Mutex<Vec<(ItemId, String)>>> = Arc::default();
     let (prog, res, outs) = (job.progress.clone(), job.result.clone(), outputs.clone());
@@ -331,14 +331,14 @@ fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, ReservedOutput, 
         prog.finished.store(true, std::sync::atomic::Ordering::Relaxed);
         *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     s.media_jobs.push(PendingJob { job: id, on_done, outputs });
     if wait || cfg!(target_arch = "wasm32") {
         run();
         poll(s);
     } else {
-        std::thread::Builder::new().name("filmcraft-proxies".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-proxies", run)?;
     }
     Ok(id)
 }

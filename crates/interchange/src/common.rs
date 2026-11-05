@@ -533,11 +533,13 @@ impl Builder {
             essential: None,
             multicam: None,
             time_interpolation: Default::default(),
+            maintain_pitch: false,
             hold_filters: false,
             field_options: None,
             source_channels: Vec::new(),
             audio_stream: 0,
             graphic: None,
+            shared_look: None,
         }
     }
 
@@ -727,6 +729,7 @@ pub(crate) fn transition_effect(name: &str, audio: bool, report: &mut Report) ->
     let fallback = if audio { "constant_power" } else { "cross_dissolve" };
     report.warn(format!("transition \"{name}\" is not supported; imported as {}", find_effect(fallback).map(|d| d.name).unwrap_or(fallback)));
     find_effect(fallback).map(|d| d.instance()).unwrap_or_else(|| EffectInstance {
+        instance_id: 0,
         effect: fallback.into(),
         enabled: true,
         params: Default::default(),

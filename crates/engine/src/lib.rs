@@ -13,16 +13,23 @@
 pub mod aaf_omf;
 pub mod agent_inspect;
 pub mod agent_plans;
+mod analysis_support;
+pub mod audio_jobs;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
+pub mod color_exchange;
+pub mod color_library;
 pub mod command_access;
 pub mod commands;
 pub mod demo;
 pub mod doc_path;
+pub mod durable_jobs;
 pub mod essential_sound;
+mod export_safety;
 pub mod export_tools;
+pub mod footage_analysis;
 pub mod grades;
 pub mod graphic_templates;
 pub mod graphics;
@@ -30,6 +37,8 @@ pub mod inspection;
 pub mod interchange;
 pub mod keyboard;
 mod keyframe_move;
+pub mod library_model;
+pub mod library_search;
 mod marker_edit;
 mod marker_export;
 pub mod masks;
@@ -39,21 +48,27 @@ pub mod media_pool;
 mod media_queue;
 pub mod media_watch;
 pub mod mixer;
+pub mod motion_templates;
 pub mod multicam;
 pub mod narration;
 pub mod operations;
+pub mod pairing;
 mod palette;
 pub mod panels;
 pub mod paste_media;
 pub mod perf;
 pub mod presets;
 pub mod previews;
+pub mod prfpset;
+pub mod profiles;
 pub mod project_manager;
 pub mod project_panel;
 pub mod project_tools;
 pub mod proxies;
+pub mod quality_control;
 pub mod relink;
 pub mod remix;
+pub mod review;
 pub mod scene_detect;
 pub mod scopes;
 pub mod sequence_extras;
@@ -62,10 +77,15 @@ pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
 pub mod source_monitor;
+pub mod subject_tools;
 pub mod sync;
 pub mod transcript;
+pub mod transcript_review;
 pub mod trim;
+pub mod upscale;
 pub mod voiceover;
+pub mod workflow;
+pub mod workflow_async;
 
 use std::sync::Arc;
 
@@ -144,6 +164,11 @@ pub trait Services: Send + Sync {
     /// A loader the media pool keeps for reading files later (image sequence frames on demand).
     /// `None`: the frames are read when the sequence is opened.
     fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
+        None
+    }
+    /// Internal source-preservation wrappers expose their immediate base so nested commands can
+    /// install the correct project-save policy. Folder/sandbox service boundaries return None.
+    fn source_write_base(&self) -> Option<Arc<dyn Services>> {
         None
     }
     /// Exports are encoded in memory and handed to [`Services::write_file`] (hosts without a
@@ -452,8 +477,10 @@ pub struct Session {
     pub project_instance: Arc<()>,
     pub history: History,
     pub operations: operations::OperationStore,
+
     pub agent_plans: agent_plans::PlanStore,
     pub revision: u64,
+    pub(crate) effect_identity_floor: u64,
     /// Bumped whenever the session installs a different project document (`file.newProject`,
     /// open/import/recovery/template). Frontends use it to discard UI state (text edits, IME
     /// owners) that belongs to the replaced document even if item ids are reused.
@@ -462,12 +489,17 @@ pub struct Session {
     pub path: Option<String>,
     pub state: EditorState,
     pub media: Arc<MediaPool>,
+    pub library_index: library_search::IndexStore,
+    pub model_jobs: library_model::ModelJobs,
+    pub workflow_tasks: workflow_async::Tasks,
     pub services: Arc<dyn Services>,
     pub events: Vec<Event>,
     /// Commands executed (for macros/debugging): (id, params).
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    pub job_registry: durable_jobs::JobRegistry,
+    pub pairings: pairing::Pairings,
     /// Export job → the offline items it drew the slate for, filled when the export finishes
     /// (#1054; `offlineMedia` in `file.exportMedia` and queue results).
     pub export_offline: std::collections::HashMap<u64, Arc<std::sync::Mutex<Vec<media_pool::OfflineMedia>>>>,
@@ -523,6 +555,8 @@ pub struct Session {
     /// Id of the outermost command [`Session::execute`] is running, stored with each undo step
     /// it makes.
     pub(crate) command_origin: Option<String>,
+    pub(crate) record_review_activity: bool,
+    pub(crate) workflow_progress: Option<Arc<filmcraft_export::Progress>>,
     /// Each media file's size and modification time when last seen (Settings ▸ Media ▸
     /// Automatically refresh growing files, [`media_watch`]).
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
@@ -580,8 +614,10 @@ impl Session {
             project_instance: Arc::new(()),
             history: History { limit: 200, ..Default::default() },
             operations: Default::default(),
+
             agent_plans: Default::default(),
             revision: 1,
+            effect_identity_floor: 1,
             document_epoch: 0,
             saved_revision: 1,
             path: None,
@@ -593,10 +629,15 @@ impl Session {
                 ..Default::default()
             },
             media: Arc::new(MediaPool::default()),
+            library_index: Default::default(),
+            model_jobs: Default::default(),
+            workflow_tasks: Default::default(),
             services,
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            job_registry: Default::default(),
+            pairings: Default::default(),
             export_offline: Default::default(),
             prefs: Default::default(),
             prefs_path: None,
@@ -623,6 +664,8 @@ impl Session {
             browser: Default::default(),
             exec_depth: 0,
             command_origin: None,
+            record_review_activity: true,
+            workflow_progress: None,
             media_stamps: Default::default(),
             media_scan: None,
         }
@@ -631,6 +674,9 @@ impl Session {
     /// Advance stepped jobs ([`SteppedJob`]) for up to `budget` (at least one step). Returns
     /// whether jobs remain. A job whose media is still loading waits for the next call.
     pub fn pump_jobs(&mut self, budget: std::time::Duration) -> bool {
+        if let Err(e) = self.job_registry.sync(&self.jobs) {
+            log::error!("{e}");
+        }
         export_tools::pump_queue(self, false);
         let t0 = web_time::Instant::now();
         while let Some(j) = self.stepped.first_mut() {
@@ -660,6 +706,12 @@ impl Session {
     /// the data directory and finds unsaved changes left by sessions that died
     /// ([`Session::recovery_candidates`]).
     pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
+        if let Err(e) = self.pairings.configure(&cfg.data_dir) {
+            self.log.push(panels::Level::Warning, "pairing", e.to_string());
+        }
+        if let Err(e) = self.job_registry.configure(&cfg.data_dir) {
+            self.log.push(panels::Level::Warning, "jobs", e.to_string());
+        }
         let prefs_path = cfg.data_dir.join("preferences.json");
         self.prefs = autosave::Preferences::load(&prefs_path);
         // a restart restores the persisted Selection Follows Playhead toggle (#3089)
@@ -709,9 +761,13 @@ impl Session {
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
+        workflow_async::poll(self);
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        if let Err(e) = self.job_registry.sync(&self.jobs) {
+            log::error!("{e}");
+        }
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };
@@ -780,6 +836,8 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        library_model::poll(self);
+        workflow_async::poll(self);
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         // headless sessions (CLI, MCP, control channel) have no UI frame loop calling
         // `poll_persistence`: apply background mask tracking before each command (#3302)
@@ -824,18 +882,21 @@ impl Session {
         // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
         // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
         // session and its unsaved project down. The panic hook has logged where it happened.
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
-            .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
+        let previous_services = self.services.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !matches!(id, "agent.execute" | "agent.plan") {
+                self.services = export_safety::SourceWriteServices::for_command(self, id)?;
+            }
+            (spec.run)(self, &params)
+        }))
+        .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
+        self.services = previous_services;
         self.exec_depth -= 1;
         if outermost {
             self.command_origin = None;
         }
         if self.exec_depth == 0 {
             source_monitor::track_history(self);
-        }
-        // source graphics: an edited instance updates the shared layers and the other instances
-        if r.is_ok() && journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
-            graphic_templates::sync_source_graphics(self);
         }
         if r.is_ok()
             && let Some(before) = transcription_before
@@ -981,10 +1042,20 @@ impl Session {
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
     pub fn edit<R>(&mut self, label: &str, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<R>) -> Result<R> {
         let mut p = (*self.project).clone();
+        p.next_effect_instance_id = p.next_effect_instance_id.max(self.effect_identity_floor);
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        // Shared graphic propagation belongs to the same working copy and identity repair.
+        if self.command_origin.as_deref().is_some_and(|id| id.starts_with("graphics.")) {
+            graphic_templates::sync_source_graphics(&mut p);
+        }
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
+        p.assign_changed_effect_ids(&self.project, self.effect_identity_floor).map_err(EngineError::Other)?;
+        if self.record_review_activity && self.command_origin.as_deref() != Some("agent.apply") && p != *self.project {
+            crate::review::record(&mut p, self.command_origin.as_deref().unwrap_or("edit"), label, self.revision, self.revision.saturating_add(1))?;
+        }
+        self.effect_identity_floor = self.effect_identity_floor.max(p.next_effect_instance_id);
         let old = std::mem::replace(&mut self.project, Arc::new(p));
         self.history.undo.push((label.to_string(), old, self.command_origin.clone()));
         if self.history.undo.len() > self.history.limit {
@@ -1008,10 +1079,22 @@ impl Session {
             return Ok(r);
         }
         let mut p = (*self.project).clone();
+        p.next_effect_instance_id = p.next_effect_instance_id.max(self.effect_identity_floor);
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        // Shared graphic propagation belongs to the same working copy and identity repair.
+        if self.command_origin.as_deref().is_some_and(|id| id.starts_with("graphics.")) {
+            graphic_templates::sync_source_graphics(&mut p);
+        }
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
+        p.assign_changed_effect_ids(&self.project, self.effect_identity_floor).map_err(EngineError::Other)?;
+        if self.record_review_activity
+            && let Some(event) = p.review.activity.last_mut().filter(|event| event.label == label)
+        {
+            event.after_revision = self.revision.saturating_add(1);
+        }
+        self.effect_identity_floor = self.effect_identity_floor.max(p.next_effect_instance_id);
         self.project = Arc::new(p);
         self.state = st;
         self.drop_stale_gap();
@@ -1022,13 +1105,16 @@ impl Session {
     /// Run several undoable edits as one undo step labelled `label`. If `f` fails, every edit it made
     /// is rolled back and the history is as before.
     pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        let group_before_revision = self.revision;
         let (project, state, undo, redo, limit) =
             (self.project.clone(), self.state.clone(), self.history.undo.len(), self.history.redo.clone(), self.history.limit);
         // keep every step the group makes, however many, so the first one can be found afterwards
         self.history.limit = usize::MAX;
+        let record_activity = std::mem::replace(&mut self.record_review_activity, false);
         // a panic inside the group must not leave the history unlimited: restore, then let it go on
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.history.limit = limit;
+        self.record_review_activity = record_activity;
         let first = self.history.undo.get(undo).map(|e| (e.1.clone(), e.2.clone()));
         let rolled_back = |s: &mut Session| {
             s.history.undo.truncate(undo);
@@ -1040,6 +1126,19 @@ impl Session {
         };
         match (r, first) {
             (Ok(Ok(v)), Some((first, origin))) => {
+                if record_activity {
+                    let before_revision = group_before_revision;
+                    if let Err(e) = crate::review::record(
+                        Arc::make_mut(&mut self.project),
+                        self.command_origin.as_deref().unwrap_or("edit.group"),
+                        label,
+                        before_revision,
+                        self.revision,
+                    ) {
+                        rolled_back(self);
+                        return Err(e);
+                    }
+                }
                 self.history.undo.truncate(undo);
                 self.history.undo.push((label.to_string(), first, origin));
                 if self.history.undo.len() > limit {
@@ -1490,3 +1589,9 @@ mod source_placement_tests;
 mod frame_export_tests;
 #[cfg(test)]
 mod wasm_clock_tests;
+
+#[cfg(test)]
+mod color_workflow_tests;
+
+#[cfg(test)]
+mod effect_id_tests;

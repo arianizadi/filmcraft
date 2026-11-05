@@ -216,8 +216,8 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|w| w.range.map_or(1, |r| proj.item(w.item).and_then(|i| i.as_media()).map_or(1, |m| crate::proxies::frame_count(m, Some(r)))))
         .sum::<u64>()
         + 1;
-    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
-    let job = crate::Job { id, label: format!("Project Manager: {name}"), progress: Default::default(), result: Default::default() };
+    let job = s.job_registry.new_job(s, format!("Project Manager: {name}"))?;
+    let id = job.id;
     job.progress.total.store(total, Ordering::Relaxed);
     let (prog, res) = (job.progress.clone(), job.result.clone());
     let prev_dst = crate::previews::dir_for_project(&project_path);
@@ -244,12 +244,12 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
         prog.finished.store(true, Ordering::Relaxed);
         *res.lock().unwrap_or_else(|x| x.into_inner()) = Some(r);
     };
-    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    let run = crate::durable_jobs::guard(s, &job, run);
     s.jobs.push(job);
     if bool_p(p, "wait").unwrap_or(false) || cfg!(target_arch = "wasm32") {
         run();
     } else {
-        std::thread::Builder::new().name("filmcraft-project-manager".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::durable_jobs::spawn(s, id, "filmcraft-project-manager", run)?;
     }
     let mut out = summary;
     out["job"] = json!(id);

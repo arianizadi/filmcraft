@@ -99,7 +99,21 @@ pub(crate) fn graphic_source(p: &mut filmcraft_project::Project, w: u32, h: u32,
 /// Place a new graphic clip holding `layer` at the playhead: on the first video track above the
 /// topmost clip at the playhead that is free for the duration (a track is added if needed).
 fn new_graphic_clip(s: &mut Session, cmd: &str, layer: filmcraft_project::EffectInstance, name: &str, p: &Value) -> Result<ClipId> {
-    let seconds = f64_p(p, "seconds").unwrap_or(5.0).max(0.01);
+    let duration = match p.get("duration") {
+        Some(value) => Tick(
+            value
+                .as_i64()
+                .filter(|n| *n > 0 && *n <= filmcraft_time::TICKS_PER_SECOND * 86400)
+                .ok_or_else(|| bad(cmd, "duration must be positive ticks and at most 24 hours"))?,
+        ),
+        None => {
+            let seconds = f64_p(p, "seconds").unwrap_or(5.0);
+            if !seconds.is_finite() || seconds <= 0.0 || seconds > 86400.0 {
+                return Err(bad(cmd, "seconds must be positive and at most 24 hours"));
+            }
+            Tick::from_seconds_f64(seconds.max(0.01))
+        }
+    };
     // Here `seconds` is duration, not the generic time parser's placement alias.
     let mut placement = p.clone();
     if let Some(params) = placement.as_object_mut() {
@@ -107,7 +121,7 @@ fn new_graphic_clip(s: &mut Session, cmd: &str, layer: filmcraft_project::Effect
     }
     place_video_clip(s, cmd, name, &placement, "New Graphic", vec![layer], move |pr, (w, h, rate)| {
         let src = graphic_source(pr, w, h, rate);
-        (src, rate.snap_nearest(Tick::from_seconds_f64(seconds)).max(rate.frame_duration()))
+        (src, rate.snap_nearest(duration).max(rate.frame_duration()))
     })
 }
 
@@ -846,7 +860,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Rectangle",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+Alt+R"),
-            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"duration":ticks? (exact duration),"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| new_shape_cmd(s, p, "rectangle"),
         ),
@@ -855,7 +869,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Ellipse",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+Alt+E"),
-            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[400,200],"clip":id?,"seconds":f64=5,"duration":ticks? (exact duration),"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| new_shape_cmd(s, p, "ellipse"),
         ),
@@ -864,7 +878,7 @@ fn menu_commands() -> Vec<CommandSpec> {
             "Polygon",
             &["Graphics and Titles", "New Layer"],
             None,
-            r#"{"position":[x,y]?,"size":[w,h]=[300,300],"sides":n=6,"clip":id?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"position":[x,y]?,"size":[w,h]=[300,300],"sides":n=6,"clip":id?,"seconds":f64=5,"duration":ticks? (exact duration),"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let mut q = if p.is_object() { p.clone() } else { json!({}) };
@@ -1013,7 +1027,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Text",
             &["Graphics and Titles", "New Layer"],
             Some("Cmd+T"),
-            r#"{"text":str="New Text","position":[x,y]? (point text: its alignment point on the first baseline; with `box`: the box's top-left corner),"box":[w,h]? (paragraph text wrapped in a box this size),"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"text":str="New Text","position":[x,y]? (point text: its alignment point on the first baseline; with `box`: the box's top-left corner),"box":[w,h]? (paragraph text wrapped in a box this size),"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"seconds":f64=5,"duration":ticks? (exact duration),"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let text = str_p(p, "text").unwrap_or("New Text").to_string();
@@ -1056,7 +1070,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Shape",
             &[],
             None,
-            r#"{"shape":"rectangle|ellipse|polygon|path","position":[x,y]? (the shape's centre),"size":[w,h]=[400,200],"points":[[x,y],…]?,"clip":id? (add the shape to this graphic),"seconds":f64=5,"track":index?,"time":ticks?}"#,
+            r#"{"shape":"rectangle|ellipse|polygon|path","position":[x,y]? (the shape's centre),"size":[w,h]=[400,200],"points":[[x,y],…]?,"clip":id? (add the shape to this graphic),"seconds":f64=5,"duration":ticks? (exact duration),"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let shape = str_p(p, "shape").unwrap_or("rectangle").to_ascii_lowercase();

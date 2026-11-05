@@ -988,7 +988,16 @@ fn upgrade_to_source(s: &mut Session, p: &Value) -> Result<Value> {
         let q = pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?;
         let (_, ti) = q.find_item_mut(clip).ok_or_else(|| bad("graphics.upgradeToSourceGraphic", "no such clip"))?;
         ti.item = item;
-        let layers: Vec<EffectInstance> = ti.effects.iter().filter(|e| graphic::is_layer(e)).cloned().collect();
+        let layers: Vec<EffectInstance> = ti
+            .effects
+            .iter()
+            .filter(|e| graphic::is_layer(e))
+            .cloned()
+            .map(|mut e| {
+                e.instance_id = 0;
+                e
+            })
+            .collect();
         let meta = ti.graphic.as_deref().cloned();
         pr.source_graphics.insert(item, SourceGraphic { layers, meta });
         st.project_selection = vec![item];
@@ -997,17 +1006,26 @@ fn upgrade_to_source(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"clip": clip.0, "item": item.0}))
 }
 
-/// After a `graphics.*` command: copy an edited instance of a source graphic to the shared
-/// layers and every other instance (in the same undo step).
-pub fn sync_source_graphics(s: &mut Session) {
-    if s.project.source_graphics.is_empty() {
+/// In a `graphics.*` working copy, propagate source values before identity validation/commit.
+/// Each placed layer retains its own identity; the shared definition has no placed identity.
+pub fn sync_source_graphics(p: &mut Project) {
+    if p.source_graphics.is_empty() {
         return;
     }
-    let p = Arc::make_mut(&mut s.project);
     let items: Vec<ItemId> = p.source_graphics.keys().copied().collect();
     for item in items {
         let master = p.source_graphics[&item].clone();
-        let layers_of = |t: &TrackItem| t.effects.iter().filter(|e| graphic::is_layer(e)).cloned().collect::<Vec<_>>();
+        let layers_of = |t: &TrackItem| {
+            t.effects
+                .iter()
+                .filter(|e| graphic::is_layer(e))
+                .cloned()
+                .map(|mut e| {
+                    e.instance_id = 0;
+                    e
+                })
+                .collect::<Vec<_>>()
+        };
         // the first instance that differs from the master is the edited one
         let mut changed: Option<SourceGraphic> = None;
         for q in p.sequences() {
@@ -1016,7 +1034,7 @@ pub fn sync_source_graphics(s: &mut Session) {
                     for t in tr.items.iter().filter(|t| t.item == item) {
                         let l = layers_of(t);
                         let m = t.graphic.as_deref().cloned();
-                        if l != master.layers || m != master.meta {
+                        if !filmcraft_project::effect::same_content(&l, &master.layers) || m != master.meta {
                             changed = Some(SourceGraphic { layers: l, meta: m });
                         }
                     }
@@ -1032,10 +1050,14 @@ pub fn sync_source_graphics(s: &mut Session) {
             if let Some(sq) = p.sequence_mut(id) {
                 for tr in &mut sq.video_tracks {
                     for t in tr.items.iter_mut().filter(|t| t.item == item) {
+                        let prior_ids: std::collections::BTreeMap<_, _> =
+                            t.effects.iter().filter(|e| graphic::is_layer(e)).map(|e| (layer_uid(e), e.instance_id)).collect();
                         let mut fx: Vec<EffectInstance> = t.effects.iter().filter(|e| !graphic::is_layer(e)).cloned().collect();
                         let at = fx.iter().position(|e| !e.def().is_some_and(|d| d.intrinsic)).unwrap_or(fx.len());
                         for (k, l) in new.layers.iter().enumerate() {
-                            fx.insert(at + k, l.clone());
+                            let mut layer = l.clone();
+                            layer.instance_id = prior_ids.get(&layer_uid(l)).copied().unwrap_or(0);
+                            fx.insert(at + k, layer);
                         }
                         t.effects = fx;
                         t.graphic = new.meta.clone().map(Box::new);

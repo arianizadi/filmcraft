@@ -9,8 +9,11 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod alpha_mask;
 pub mod caption;
+pub mod color_workflow;
 pub mod effect;
+pub mod effect_ids;
 pub mod essential;
 pub mod find;
 pub mod graphic;
@@ -25,6 +28,7 @@ pub mod mask;
 pub mod mixer;
 pub mod multicam;
 pub mod narration;
+pub mod review;
 pub mod transcript;
 pub mod vtransition;
 
@@ -35,6 +39,7 @@ use filmcraft_media::{Generator, MediaInfo};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 
+pub use alpha_mask::{AlphaFrame, AlphaTrack};
 pub use caption::{Caption, CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, plain_text};
 pub use effect::{EffectDef, EffectInstance, EffectKind, ParamDef, ParamKind, effect_defs, find_effect};
 pub use essential::{AudioType, EssentialSound};
@@ -85,6 +90,8 @@ id_type!(MarkerId);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default, skip_serializing_if = "color_workflow::ColorWorkflow::is_empty")]
+    pub color_workflow: color_workflow::ColorWorkflow,
     pub name: String,
     /// Custom marker/clip swatches saved only with this project (schema v16).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -96,6 +103,9 @@ pub struct Project {
     pub items: BTreeMap<ItemId, ProjectItem>,
     /// Monotonic id source for all id types.
     pub next_id: u64,
+    /// Persistent monotonic namespace of placed effect instances (separate from clip/item IDs).
+    #[serde(default = "effect_ids::initial_counter")]
+    pub next_effect_instance_id: u64,
     /// The project's LUT library (Lumetri Input LUT / Creative Look "Browse…"). LUT files are
     /// embedded, so projects render without the original files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -104,6 +114,9 @@ pub struct Project {
     /// are media time. Shared (`Arc`) so undo snapshots don't copy them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub transcripts: BTreeMap<ItemId, std::sync::Arc<Transcript>>,
+    /// Source word high-water marks survive deletion and regeneration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub transcript_word_counters: BTreeMap<ItemId, u64>,
     /// Search bins (File ▸ New ▸ Search Bin): saved Find queries listed in the Project panel.
     /// Schema v11.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -120,6 +133,9 @@ pub struct Project {
     /// instructions for whoever opens it next, frame numbers and the like. Schema v15.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Saved agent review, checkpoints and editing profile versions (schema v18).
+    #[serde(default, skip_serializing_if = "review::ReviewState::is_empty")]
+    pub review: review::ReviewState,
 }
 
 impl Default for Project {
@@ -136,6 +152,7 @@ impl Project {
 
     pub fn new(name: &str) -> Self {
         Self {
+            color_workflow: color_workflow::ColorWorkflow::default(),
             name: name.into(),
             custom_colors: Vec::new(),
             custom_color_names: BTreeMap::new(),
@@ -143,12 +160,15 @@ impl Project {
             root: Bin { id: BinId(0), name: name.into(), children: Vec::new() },
             items: BTreeMap::new(),
             next_id: 1,
+            next_effect_instance_id: 1,
             luts: Vec::new(),
             transcripts: BTreeMap::new(),
+            transcript_word_counters: BTreeMap::new(),
             search_bins: Vec::new(),
             source_graphics: BTreeMap::new(),
             narrations: BTreeMap::new(),
             notes: String::new(),
+            review: review::ReviewState::default(),
         }
     }
 
@@ -163,7 +183,7 @@ impl Project {
     /// item is gone): a new item taking that id would be picked up by the reference. The root bin
     /// counts, so there is always one.
     pub fn max_id(&self) -> u64 {
-        let mut max = 0;
+        let mut max = self.color_workflow.max_id();
         let mut see = |id: u64| max = max.max(id);
         let mut bins = vec![&self.root];
         while let Some(bin) = bins.pop() {
@@ -177,7 +197,12 @@ impl Project {
         }
         self.search_bins.iter().for_each(|b| see(b.id.0));
         // deleting an item leaves these entries behind: a new item taking that id would inherit them
-        self.transcripts.keys().chain(self.source_graphics.keys()).chain(self.narrations.keys()).for_each(|i| see(i.0));
+        self.transcripts
+            .keys()
+            .chain(self.transcript_word_counters.keys())
+            .chain(self.source_graphics.keys())
+            .chain(self.narrations.keys())
+            .for_each(|i| see(i.0));
         // `lut.import` names LUTs `lut<id>`
         self.luts.iter().filter_map(|l| l.id.strip_prefix("lut")?.parse().ok()).for_each(&mut see);
         fn mixer(m: &MixerStrip) -> impl Iterator<Item = u64> + '_ {
@@ -465,6 +490,7 @@ impl Project {
         } else {
             Vec::new()
         };
+        self.fresh_effect_instance_ids(&mut effects).ok()?;
         let id = ClipId(self.alloc_id());
         let dur = seq_rate.snap_nearest(source.duration).max(seq_rate.frame_duration());
         Some(TrackItem {
@@ -489,11 +515,13 @@ impl Project {
             essential: None,
             multicam,
             time_interpolation: TimeInterpolation::default(),
+            maintain_pitch: false,
             hold_filters: false,
             field_options: None,
             source_channels,
             audio_stream: 0,
             graphic: source_graphic.and_then(|sg| sg.meta.map(Box::new)),
+            shared_look: None,
         })
     }
 

@@ -41,6 +41,7 @@
 //!   would drop them when saving.
 //! - **v16**: marker authors, named project swatches, and exact marker/clip hex colors.
 //! - **v17**: optional marker URLs, independent of notes and retained across marker-type changes.
+//! - **v18**: review checkpoints, annotations, activity, profiles, stable transcript source-word IDs and shared color workflow.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -63,7 +64,7 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 /// edit a shipped one.
 pub const MIGRATIONS: &[Migration] = &[
     v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
-    v15_to_v16, v16_to_v17,
+    v15_to_v16, v16_to_v17, v17_to_v18,
 ];
 
 /// The schema version this build writes (and the newest it reads).
@@ -220,9 +221,27 @@ pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
 /// Refuse only values that would overflow or exhaust memory later (`Sequence::check_bounds`);
 /// structural rules such as overlaps are left to the editor, so projects that open today still open.
 fn validate_loaded(mut loaded: Loaded) -> Result<Loaded, FormatError> {
+    loaded
+        .project
+        .color_workflow
+        .validate()
+        .and_then(|()| loaded.project.color_workflow.validate_references(&loaded.project))
+        .map_err(|e| FormatError::Corrupt(format!("color workflow: {e}")))?;
     // Graphic layers written before they carried a uid get a stable identity now, before any
     // undo history exists. The field is optional in the schema, so this is not a schema upgrade.
     loaded.project.ensure_graphic_layer_uids();
+    loaded.project.ensure_effect_instance_ids().map_err(FormatError::Corrupt)?;
+    loaded.project.review.check().map_err(FormatError::Corrupt)?;
+    for (item, transcript) in loaded.project.transcripts.iter_mut() {
+        let t = std::sync::Arc::make_mut(transcript);
+        t.next_word_id = t.next_word_id.max(loaded.project.transcript_word_counters.get(item).copied().unwrap_or(0));
+        t.ensure_word_ids().map_err(FormatError::Corrupt)?;
+        loaded.project.transcript_word_counters.insert(*item, t.next_word_id);
+    }
+    if loaded.project.transcript_word_counters.values().any(|id| *id > u64::MAX / 2) {
+        return Err(FormatError::Corrupt("source word identity counter exceeds supported range".into()));
+    }
+
     // Embedded LUT text is rendered on the hot path. Drop oversize entries at load time so a
     // hostile project cannot retain an unrenderable multi-megabyte source or repeatedly offer it
     // to renderers. Clips that refer to one simply have no LUT, like a deleted library entry.
@@ -406,13 +425,18 @@ fn v16_to_v17(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+/// v17 → v18: review persistence and stable source-word IDs. Defaults retain older projects.
+fn v17_to_v18(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
     }
 
     #[test]
@@ -621,5 +645,63 @@ mod tests {
         assert!(matches!(migrate_with(table, serde_json::json!({}), 5), Err(FormatError::TooNew { found: 5, supported: 4 })));
         let e = migrate_with(&[a, fail], serde_json::json!({}), 1).unwrap_err();
         assert!(matches!(e, FormatError::Migration { from: 2, .. }), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod effect_identity_regressions {
+    use super::*;
+    use filmcraft_project::{ItemKind, Label, SequenceSettings, TrackKind};
+    use filmcraft_time::{FrameRate, Tick, TimeRange};
+    fn project() -> filmcraft_project::Project {
+        let mut p = filmcraft_project::Project::new("legacy");
+        let source = p.add_item("graphic", Label::Iris, ItemKind::Graphic { width: 16, height: 16, rate: FrameRate::FPS_24 }, None);
+        let seq = p.new_sequence("seq", SequenceSettings::default(), 1, 0, None);
+        let clip = p.make_track_item(source, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, Tick::from_units(1, 1)), FrameRate::FPS_24).unwrap();
+        p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
+        p
+    }
+    fn legacy(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                o.remove("instance_id");
+                o.remove("next_effect_instance_id");
+                for value in o.values_mut() {
+                    legacy(value);
+                }
+            }
+            Value::Array(a) => {
+                for value in a {
+                    legacy(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[test]
+    fn legacy_ids_load_deterministically_and_nonzero_duplicates_fail_without_panic() {
+        let p = project();
+        let mut value: Value = serde_json::from_slice(&encode(&p, false)).unwrap();
+        legacy(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let a = decode(&bytes).unwrap().project;
+        let b = decode(&bytes).unwrap().project;
+        let ids = |p: &filmcraft_project::Project| {
+            p.items
+                .values()
+                .filter_map(|i| i.as_sequence())
+                .flat_map(|q| q.all_tracks().flat_map(|t| &t.items))
+                .flat_map(|clip| clip.effects.iter().map(|e| e.instance_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(a.next_effect_instance_id, b.next_effect_instance_id);
+        assert!(a.next_effect_instance_id > 1);
+        let mut corrupt = p;
+        let q = corrupt.items.values_mut().find_map(|i| i.as_sequence_mut()).unwrap();
+        let effects = &mut q.video_tracks[0].items[0].effects;
+        effects[1].instance_id = effects[0].instance_id;
+        let bytes = encode(&corrupt, false);
+        assert!(std::panic::catch_unwind(|| decode(&bytes)).unwrap().is_err());
     }
 }
