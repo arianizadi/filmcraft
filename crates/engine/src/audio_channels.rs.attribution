@@ -1,0 +1,8 @@
+asset:        audio_channels.rs
+title:        Original conservative microphone cleanup recipes
+author:       FilmCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: ../../../LICENSE-MIT, ../../../LICENSE-APACHE
+added:        2026-11-05 by FilmCraft contributors
+notes:        Original native dialogue/podcast DSP parameter choices. No third-party preset, plugin, recording or artwork copied. Settings remain editable and use the existing FilmCraft algorithms.

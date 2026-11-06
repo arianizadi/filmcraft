@@ -8,7 +8,7 @@ use filmcraft_project::{ItemId, Project, review::EditingProfile};
 use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 const MAX_ITEMS: usize = 32;
 const MAX_SHOTS: usize = 96;
@@ -122,16 +122,18 @@ fn validate_request(p: &Value, keys: &[&str]) -> Result<()> {
         if !keys.contains(&key.as_str()) {
             return Err(err(format!("unknown parameter `{key}`")));
         }
-        if ["apply", "analyze", "captions", "normalizeAudio", "transcribe", "qc", "wait"].contains(&key.as_str()) && !value.is_boolean() {
+        if ["apply", "analyze", "captions", "normalizeAudio", "repairChannels", "polishVoice", "transcribe", "qc", "wait"].contains(&key.as_str())
+            && !value.is_boolean()
+        {
             return Err(err(format!("{key} must be a boolean")));
         }
-        if ["maxShots", "musicItem", "plan"].contains(&key.as_str()) && !value.is_u64() {
+        if ["maxShots", "musicItem", "plan", "mainAudioStream"].contains(&key.as_str()) && !value.is_u64() {
             return Err(err(format!("{key} must be an unsigned integer")));
         }
         if key == "targetDurationTicks" && !value.is_i64() {
             return Err(err("targetDurationTicks must be integer ticks"));
         }
-        if ["profile", "mode", "name", "path"].contains(&key.as_str()) && !value.is_string() {
+        if ["profile", "mode", "name", "path", "secondaryAudio", "voiceTone"].contains(&key.as_str()) && !value.is_string() {
             return Err(err(format!("{key} must be text")));
         }
     }
@@ -149,6 +151,12 @@ const EDIT_KEYS: &[&str] = &[
     "overrides",
     "analyze",
     "normalizeAudio",
+    "repairChannels",
+    "secondaryAudio",
+    "mainAudioStream",
+    "polishVoice",
+    "voiceTone",
+    "voiceIntensity",
     "captions",
     "apply",
     "transcribe",
@@ -403,6 +411,47 @@ fn choose_ranges(s: &Session, ids: &[ItemId], selection: Selection<'_>, warnings
     }
     Ok(ranges)
 }
+struct AudioPlan<'a> {
+    audio: &'a [Value],
+    repair_audio: &'a [Value],
+    audio_by_stream: &'a BTreeMap<usize, Vec<Value>>,
+    requested_main: usize,
+    secondary_audio: &'a str,
+    mode: &'a str,
+    voice_tone: &'a str,
+    voice_intensity: f64,
+}
+fn propose_audio_steps(steps: &mut Vec<Value>, warnings: &mut Vec<String>, p: &Value, profile: &EditingProfile, audio_plan: AudioPlan<'_>) {
+    let AudioPlan { audio, repair_audio, audio_by_stream, requested_main, secondary_audio, mode, voice_tone, voice_intensity } = audio_plan;
+    if !audio.is_empty() {
+        for (stream, group) in audio_by_stream {
+            steps.push(json!({"id":"audio.streams.configure","params":{"clips":group,"mainStream":stream,"muteSecondary":secondary_audio=="mute"}}));
+        }
+        warnings.push(format!(
+            "Requested main audio stream {requested_main} (zero based). {} Physical microphone identity is not inferred from stream order.",
+            if secondary_audio == "mute" {
+                "Other linked container streams are retained muted for backup review."
+            } else {
+                "Additional container streams remain audible; audition for doubled dialogue or phase cancellation."
+            }
+        ));
+        if p["repairChannels"].as_bool().unwrap_or(mode == "talkingHead") {
+            for group in repair_audio.chunks(16) {
+                steps.push(json!({"id":"audio.channels.set","params":{"clips":group,"mode":"auto"}}));
+            }
+        }
+    }
+    if !audio.is_empty() && p["polishVoice"].as_bool().unwrap_or(mode == "talkingHead") {
+        for group in audio.chunks(16) {
+            steps.push(json!({"id":"audio.voice.polish","params":{"clips":group,"tone":voice_tone,"intensity":voice_intensity}}));
+        }
+        warnings.push(format!("Editable native {voice_tone} voice recipe at intensity {voice_intensity}; audition the proposal before approval."));
+    }
+    if !audio.is_empty() && p["normalizeAudio"].as_bool().unwrap_or(true) {
+        steps.push(json!({"id":"essentialSound.setType","params":{"clips":audio,"type":if mode=="dj"{"music"}else{"dialogue"}}}));
+        steps.push(json!({"id":"workflow.normalizeAudio","params":{"clips":audio,"target":profile.loudness_lufs}}));
+    }
+}
 fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
     stage(s, 420, "Analyzing source footage")?;
     validate_request(p, EDIT_KEYS)?;
@@ -424,6 +473,23 @@ fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let music = p["musicItem"].as_u64().map(ItemId);
+    let requested_main = p["mainAudioStream"].as_u64().unwrap_or(0);
+    if requested_main >= filmcraft_media::MAX_AUDIO_STREAMS as u64 {
+        return Err(err("mainAudioStream exceeds supported stream limit"));
+    }
+    let requested_main = requested_main as usize;
+    let voice_tone = p["voiceTone"].as_str().unwrap_or("neutral");
+    if !matches!(voice_tone, "neutral" | "warm" | "bright") {
+        return Err(err("voiceTone must be neutral, warm or bright"));
+    }
+    let voice_intensity = match p.get("voiceIntensity") {
+        Some(v) => v.as_f64().filter(|v| v.is_finite() && (0.0..=1.0).contains(v)).ok_or_else(|| err("voiceIntensity must be finite in0..1"))?,
+        None => 0.35,
+    };
+    let secondary_audio = p["secondaryAudio"].as_str().unwrap_or("mute");
+    if !matches!(secondary_audio, "mute" | "keep") {
+        return Err(err("secondaryAudio must be mute or keep"));
+    }
     if music.is_some_and(|id| !ids.contains(&id)) {
         return Err(err("musicItem must be included in items"));
     }
@@ -445,11 +511,26 @@ fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
     if ranges.len() > max_shots as usize {
         return Err(err(format!("{} proposed ranges exceed maxShots; raise it to at most96 or use fewer inputs", ranges.len())));
     }
+    let source_audio_tracks = ids
+        .iter()
+        .filter_map(|id| s.project.resolve_media(*id))
+        .map(|(_, m, _)| {
+            let map = m.interpret.audio_channels.as_ref().map(|a| a.clips.as_slice()).unwrap_or(&[]);
+            crate::commands::audio_placement_specs(map, m.info.audio_streams.len()).len()
+        })
+        .max()
+        .unwrap_or(1);
+    let music_track = source_audio_tracks.saturating_add(1);
+    if music.is_some() && music_track > crate::sequence_tools::MAX_TRACKS {
+        return Err(err("no separate audio track remains for music"));
+    }
     let mut steps = vec![
-        json!({"id":"file.newSequence","params":{"name":p["name"].as_str().unwrap_or("Automatic edit"),"width":profile.delivery.width,"height":profile.delivery.height,"frameRate":{"num":profile.delivery.fps_num,"den":profile.delivery.fps_den},"video":2,"audio":2}}),
+        json!({"id":"file.newSequence","params":{"name":p["name"].as_str().unwrap_or("Automatic edit"),"width":profile.delivery.width,"height":profile.delivery.height,"frameRate":{"num":profile.delivery.fps_num,"den":profile.delivery.fps_den},"video":2,"audio":source_audio_tracks.max(2)}}),
     ];
     let mut cursor = Tick::ZERO;
     let mut audio = Vec::new();
+    let mut repair_audio = Vec::new();
+    let mut audio_by_stream: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
     let mut video = Vec::new();
     let mut chosen = Vec::new();
     let mut truncated = false;
@@ -474,7 +555,23 @@ fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
             video.push(json!({"$step":index,"path":"/clips/0"}));
         }
         if has_audio && (mode != "dj" || music.is_none()) {
-            audio.push(json!({"$step":index,"path":if has_video{"/clips/1"}else{"/clips/0"}}));
+            let specs = placement_audio_specs(s, id);
+            let actual_main = if specs.iter().any(|spec| spec.audio_stream == requested_main) { requested_main } else { 0 };
+            if actual_main != requested_main {
+                warnings.push(format!("Source {} has no audio stream {requested_main}; stream0 is used for this occurrence.", id.0));
+            }
+            // A source channel map can place several stream0 clips before further native streams.
+            for (position, _) in specs.iter().enumerate().filter(|(_, spec)| spec.audio_stream == actual_main) {
+                let reference = json!({"$step":index,"path":format!("/clips/{}",position.saturating_add(usize::from(has_video)))});
+                audio.push(reference.clone());
+                if duration.0 <= 300 * TICKS_PER_SECOND {
+                    repair_audio.push(reference.clone());
+                } else {
+                    warnings
+                        .push(format!("Source {} range exceeds complete channel-analysis limit300s; automatic routing is skipped for this occurrence.", id.0));
+                }
+                audio_by_stream.entry(actual_main).or_default().push(reference);
+            }
         }
         chosen.push(json!({"item":id.0,"sourceStart":span.start.0,"sourceEnd":span.start.0.saturating_add(duration.0),"timelineStart":cursor.0,"timelineEnd":cursor.0.saturating_add(duration.0),"basis":if mode=="talkingHead"{"saved transcript pauses/fillers where available"}else{"measured sharpness/motion sample; no semantic judgment"}}));
         cursor = Tick(cursor.0.checked_add(duration.0).filter(|n| *n <= Tick::MAX.0).ok_or_else(|| err("timeline duration exceeds supported bounds"))?);
@@ -486,8 +583,13 @@ fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let duration = cursor.min(source.duration());
         let index = steps.len();
-        steps.push(json!({"id":"timeline.place","params":{"item":music.0,"time":0,"sourceIn":0,"duration":duration.0,"track":"V2","audioTrack":"A2","video":false,"audio":true}}));
-        audio.push(json!({"$step":index,"path":"/clips/0"}));
+        steps.push(json!({"id":"timeline.place","params":{"item":music.0,"time":0,"sourceIn":0,"duration":duration.0,"track":"V2","audioTrack":format!("A{music_track}"),"video":false,"audio":true}}));
+        let reference = json!({"$step":index,"path":"/clips/0"});
+        audio.push(reference.clone());
+        if duration.0 <= 300 * TICKS_PER_SECOND {
+            repair_audio.push(reference.clone());
+        }
+        audio_by_stream.entry(0).or_default().push(reference);
         if source.duration() < cursor {
             warnings.push("Music is shorter than the cut; the final section will have no music.".into())
         }
@@ -502,10 +604,22 @@ fn auto_edit(s: &mut Session, p: &Value) -> Result<Value> {
     steps.push(
         json!({"id":"profile.apply","params":{"name":profile.name,"version":profile.version,"overrides":p.get("overrides").cloned().unwrap_or(json!({}))}}),
     );
-    if !audio.is_empty() && p["normalizeAudio"].as_bool().unwrap_or(true) {
-        steps.push(json!({"id":"essentialSound.setType","params":{"clips":audio,"type":if mode=="dj"{"music"}else{"dialogue"}}}));
-        steps.push(json!({"id":"workflow.normalizeAudio","params":{"clips":audio,"target":profile.loudness_lufs}}));
-    }
+    propose_audio_steps(
+        &mut steps,
+        &mut warnings,
+        p,
+        &profile,
+        AudioPlan {
+            audio: &audio,
+            repair_audio: &repair_audio,
+            audio_by_stream: &audio_by_stream,
+            requested_main,
+            secondary_audio,
+            mode,
+            voice_tone,
+            voice_intensity,
+        },
+    );
     if let Some(look) = &profile.reference_look {
         for clip in &video {
             steps.push(json!({"id":"grade.look.link","params":{"look":look,"clip":clip}}));
@@ -759,6 +873,14 @@ fn prepare(s: &mut Session, p: &Value) -> Result<Value> {
     }
     Ok(report)
 }
+fn placement_audio_specs(s: &Session, id: ItemId) -> Vec<crate::commands::AudioPlacementSpec> {
+    let (map, count) = s
+        .project
+        .resolve_media(id)
+        .map(|(_, m, _)| (m.interpret.audio_channels.as_ref().map(|a| a.clips.clone()).unwrap_or_default(), m.info.audio_streams.len()))
+        .unwrap_or_default();
+    crate::commands::audio_placement_specs(&map, count)
+}
 fn normalize_audio(s: &mut Session, p: &Value) -> Result<Value> {
     let clips = p["clips"].as_array().filter(|a| a.len() <= 192).ok_or_else(|| err("supply at most192 audio clip IDs"))?;
     let ids = clips.iter().map(|v| v.as_u64().map(filmcraft_project::ClipId).ok_or_else(|| err("invalid clip ID"))).collect::<Result<Vec<_>>>()?;
@@ -767,7 +889,6 @@ fn normalize_audio(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let target = p["target"].as_f64().filter(|v| v.is_finite() && (-60.0..=0.0).contains(v)).ok_or_else(|| err("target loudness must be -60–0 LUFS"))?;
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
-    let provider = s.media.provider(s.project.clone(), s.services.clone());
     let mut audible = Vec::new();
     let mut skipped = Vec::new();
     let mut seconds = 0i64;
@@ -779,23 +900,26 @@ fn normalize_audio(s: &mut Session, p: &Value) -> Result<Value> {
         if q.track(track).is_some_and(|t| t.locked) {
             return Err(err("audio target is locked"));
         }
-        let duration = clip.duration.0 / TICKS_PER_SECOND;
-        if seconds.saturating_add(duration) > 3600 {
-            skipped.push(json!({"clip":id.0,"reason":"automatic measurement exceeds one-hour read budget; explicit loudness job required"}));
+        let duration = clip.duration.0.saturating_add(TICKS_PER_SECOND - 1) / TICKS_PER_SECOND;
+        if duration > 300 || seconds.saturating_add(duration) > 3600 {
+            skipped.push(
+                json!({"clip":id.0,"reason":"full-clip normalization exceeds 300-second per-clip or one-hour total read budget; split or measure explicitly"}),
+            );
             continue;
         }
         seconds = seconds.saturating_add(duration);
-        if crate::essential_sound::clip_loudness(clip, q.settings.sample_rate.max(1), &provider).is_some() {
-            audible.push(id.0);
-        } else {
-            skipped.push(json!({"clip":id.0,"reason":"no measurable audio"}));
+        audible.push(id.0);
+    }
+    let mut results = Vec::new();
+    s.edit_group("Normalize Measurable Audio", |s| {
+        for group in audible.chunks(16) {
+            results.push(s.execute("audio.normalize", json!({"clips":group,"targetLufs":target,"maxGainDb":12,"truePeakDbtp":-1}))?);
         }
-    }
-    if audible.is_empty() {
-        return Ok(json!({"matches":[],"skipped":skipped,"method":"ITU-R BS.1770 integrated loudness"}));
-    }
-    let result = s.execute("essentialSound.autoMatch", json!({"clips":audible,"target":target}))?;
-    Ok(json!({"matches":result,"skipped":skipped,"method":"ITU-R BS.1770 integrated loudness"}))
+        Ok(())
+    })?;
+    Ok(
+        json!({"matches":results,"skipped":skipped,"method":"post-effects ITU-R BS.1770 integrated loudness; output Volume offsets; -1 dBTP measured clip ceiling","warning":"Simultaneous sources, transitions and master effects can change final-mix peaks; verify the export."}),
+    )
 }
 
 fn available_sequence_media(s: &Session, sequence: ItemId) -> Result<()> {
@@ -1008,7 +1132,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec(
             "workflow.autoEdit",
             "Automatically Propose an Edit",
-            r#"{"items":[id],"profile":str?,"mode":"talkingHead|dj|selects"?,"musicItem":id?,"targetDurationTicks":ticks?,"maxShots":1..96=48,"overrides":object?,"analyze":bool=true,"normalizeAudio":bool=true,"captions":bool?,"apply":bool=false}"#,
+            r#"{"items":[id],"profile":str?,"mode":"talkingHead|dj|selects"?,"musicItem":id?,"targetDurationTicks":ticks?,"maxShots":1..96=48,"overrides":object?,"analyze":bool=true,"normalizeAudio":bool=true,"repairChannels":bool?,"mainAudioStream":0..63=0,"secondaryAudio":"mute|keep"?,"captions":bool?,"apply":bool=false}"#,
             auto_edit,
             false,
         ),

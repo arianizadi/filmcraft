@@ -30,7 +30,7 @@ use crate::{EngineError, Result, Session};
 type Run = fn(&mut Session, &Value) -> Result<Value>;
 type Enabled = fn(&Session) -> std::result::Result<(), String>;
 
-/// The audio clips a command acts on: `clips` (or `clip`), else the selection, with linked partners.
+/// Audio targets are exact. Video selections may reach their linked audio partners.
 pub fn targets(s: &Session, p: &Value) -> Vec<ClipId> {
     let sel: Vec<ClipId> = match p.get("clips").and_then(Value::as_array) {
         Some(a) => a.iter().filter_map(|v| v.as_u64().map(ClipId)).collect(),
@@ -40,8 +40,10 @@ pub fn targets(s: &Session, p: &Value) -> Vec<ClipId> {
         },
     };
     let Some(seq) = s.active_sequence() else { return Vec::new() };
-    let all = with_links(s, &sel);
-    seq.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|i| all.contains(&i.id)).map(|i| i.id).collect()
+    let video: Vec<ClipId> =
+        sel.iter().copied().filter(|id| seq.find_item(*id).is_some_and(|(track, _)| seq.video_tracks.iter().any(|t| t.id == track))).collect();
+    let linked = with_links(s, &video);
+    seq.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|i| sel.contains(&i.id) || linked.contains(&i.id)).map(|i| i.id).collect()
 }
 
 fn mt_of(it: &TrackItem, t: Tick) -> Tick {

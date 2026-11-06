@@ -10,6 +10,7 @@
 //! * [`resample`] — streaming, block-invariant rate conversion for playback on a device at another rate.
 //! * [`stretch`] — WSOLA time stretch that keeps the pitch (Speed/Duration ▸ Maintain Audio Pitch).
 //! * [`channels`] — channel layouts, ITU-R BS.775 up/downmix, 5.1 mixdown types, the 5.1 panner.
+//! * [`inspect`] — streaming per-channel measurements and conservative routing/mono evidence.
 //!
 //! Conventions: audio is **planar f32** (`&mut [&mut [f32]]`, one slice per channel, all the same
 //! length). `process` never allocates; all buffers are sized at construction. Parameters may be
@@ -26,6 +27,7 @@ pub mod design;
 pub mod ducking;
 pub mod effects;
 pub mod fft;
+pub mod inspect;
 pub mod loudness;
 pub mod oversample;
 pub mod remix;

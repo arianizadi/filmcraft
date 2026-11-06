@@ -568,3 +568,12 @@ One recording is bounded to 24 hours, 4096 windows and one million words. Diariz
 separate windows are named separately rather than claiming a cross-window speaker match.
 Automatic delivery chooses a new output name and refuses existing movie/sidecar files, preserving
 original footage and earlier deliveries.
+
+## Microphone automation
+
+For native microphone controls and agent examples, see [audio-workflow.md](audio-workflow.md).
+Start with `audio_channels_get` / `audio_inspect`, choose native streams/channels explicitly,
+then use `prepare_audio`, `prepare_audio_sync` or `prepare_audio_mix`. `audio_preview` returns
+actual float-WAV MCP audio blocks, including frozen-plan before/after comparisons. Approve with
+`apply_plan` and the same stable operation identity; verify sequence/export loudness separately.
+Do not infer microphone identity from container-stream order or force genuine stereo to mono.

@@ -1,0 +1,8 @@
+asset:        audio_voice.rs
+title:        Original editable voice-polish parameter recipes
+author:       FilmCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: ../../../LICENSE-MIT, ../../../LICENSE-APACHE
+added:        2026-11-05 by FilmCraft contributors
+notes:        Neutral, warm and bright parameter choices created for FilmCraft. General technique reference supplied by the user: https://www.youtube.com/watch?v=DApZ77agrsA (EQ, multiband compression, limiting). No third-party presets, code, audio, video, screenshots or artwork are copied or bundled. High-pass terminology is corrected; no gain boost follows the limiter. Final delivery peaks remain independently verified.

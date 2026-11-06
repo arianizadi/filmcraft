@@ -332,7 +332,8 @@ pub fn authorize(s: &Session, grant: &Grant, id: &str, p: &Value) -> Result<()> 
     if matches!(id, "file.open" | "file.saveAs" | "agent.connections") {
         return Err(error("this action belongs to the owner connection; paired connections stay on their approved project"));
     }
-    if matches!(id, "jobs.get" | "jobs.cancel" | "jobs.forget") || id == "workflow.status" && p.get("job").is_some_and(|v| !v.is_null()) {
+    if matches!(id, "jobs.get" | "jobs.cancel" | "jobs.forget" | "audio.inspectStatus") || id == "workflow.status" && p.get("job").is_some_and(|v| !v.is_null())
+    {
         let job = p.get("job").and_then(Value::as_u64).and_then(|id| s.job_registry.get(id)).ok_or_else(|| error("no accessible job in this project"))?;
         if !belongs_to_project(&job, grant) {
             return Err(error("no accessible job in this project"));

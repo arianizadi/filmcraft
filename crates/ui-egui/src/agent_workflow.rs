@@ -10,6 +10,9 @@ pub struct AgentWorkflow {
     items: String,
     profile: String,
     mode: usize,
+    main_audio_stream: u32,
+    keep_secondary_audio: bool,
+    voice_tone: usize,
     pending: Option<workflow::BackgroundJob<PreparedEditPlan>>,
     message: String,
     output: String,
@@ -258,6 +261,22 @@ pub(crate) fn show(app: &mut FilmcraftApp, state: &mut AgentWorkflow, ui: &mut e
                 }
             }
         });
+        ui.horizontal_wrapped(|ui|{
+            ui.label("Main audio stream (zero based)");
+            let r=ui.add(egui::DragValue::new(&mut state.main_audio_stream).range(0..=63));
+            app.auto.add_response("agentWorkflow.mainAudioStream",&r,"Main source audio stream");
+            let r=ui.checkbox(&mut state.keep_secondary_audio,"Keep backup streams audible");
+            app.auto.add_response("agentWorkflow.keepSecondaryAudio",&r,"Keep backup streams audible");
+        });
+        ui.label("Other streams are retained muted by default. Choose the mic from source inspection; stream order does not identify hardware. Missing streams use stream0 with a warning.");
+        ui.horizontal_wrapped(|ui|{
+            ui.label("Voice tone");
+            for (index,label) in ["Neutral","Warm","Bright"].into_iter().enumerate(){
+                let r=ui.selectable_label(state.voice_tone==index,label);
+                app.auto.add_response(&format!("agentWorkflow.voiceTone.{index}"),&r,label);
+                if r.clicked(){state.voice_tone=index;}
+            }
+        });
         speech_model_controls(app, state, ui);
         ui.label("Saved profile name (empty uses an automatic profile)");
         let r = ui.text_edit_singleline(&mut state.profile);
@@ -276,7 +295,7 @@ pub(crate) fn show(app: &mut FilmcraftApp, state: &mut AgentWorkflow, ui: &mut e
                 2 => "selects",
                 _ => "talkingHead",
             };
-            let mut p = json!({"mode":mode,"transcribe":true,"analyze":true,"apply":false});
+            let mut p = json!({"mode":mode,"transcribe":true,"analyze":true,"apply":false,"mainAudioStream":state.main_audio_stream,"voiceTone":(["neutral","warm","bright"].get(state.voice_tone).copied().unwrap_or("neutral")),"secondaryAudio":if state.keep_secondary_audio{"keep"}else{"mute"}});
             let parsed = if state.paths.trim().is_empty() {
                 state.items.split([',', ' ', '\n']).filter(|s| !s.is_empty()).map(str::parse::<u64>).collect::<Result<Vec<_>, _>>().map(|ids| {
                     p["items"] = json!(ids);

@@ -5,6 +5,74 @@ use super::{AUDIO_RETRY_S, AUDIO_STALL_S, FilmcraftApp, Tick, frames, json, pane
 use filmcraft_engine::Session;
 
 impl FilmcraftApp {
+    /// Audition bounded decoded PCM without importing media or seeking either monitor.
+    pub fn play_audio_preview(&mut self, audio: filmcraft_frame::AudioBuffer) -> Result<f64, String> {
+        let frames = audio.frames();
+        if !(8_000..=192_000).contains(&audio.sample_rate)
+            || !(1..=2).contains(&audio.channel_count())
+            || frames == 0
+            || frames > audio.sample_rate as usize * 10
+            || audio.channels.iter().any(|c| c.len() != frames || c.iter().any(|v| !v.is_finite()))
+        {
+            return Err("Audio audition requires finite mono/stereo PCM, 8–192 kHz, up to ten seconds.".into());
+        }
+        if self.session.mixrec.active() || self.session.mcrec.active() || self.session.voiceover.recording() {
+            return Err("Stop recording before auditioning audio.".into());
+        }
+        if self.audio.is_none() {
+            return Err("No audio output; check Settings > Audio Hardware.".into());
+        }
+        self.stop_source();
+        self.stop();
+        let output = self.audio.as_mut().ok_or("No audio output")?;
+        let seconds = frames as f64 / f64::from(audio.sample_rate);
+        // A device may negotiate a different rate during start. Prime with silence until its
+        // actual rate is known, then resample without losing or mixing the source channels.
+        let output_rate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let callback_rate = output_rate.clone();
+        let mut position = 0.0f64;
+        let fill = Box::new(move |buffer: &mut [f32], channels: usize| {
+            let rate = callback_rate.load(std::sync::atomic::Ordering::Relaxed);
+            if rate == 0 {
+                buffer.fill(0.0);
+                return;
+            }
+            let step = f64::from(audio.sample_rate) / f64::from(rate);
+            for frame in buffer.chunks_mut(channels.max(1)) {
+                frame.fill(0.0);
+                if position >= frames as f64 {
+                    continue;
+                }
+                let index = position as usize;
+                let fraction = (position - index as f64) as f32;
+                let sample = |channel: usize| {
+                    let source = audio.channels.get(channel).or_else(|| audio.channels.first());
+                    let a = source.and_then(|c| c.get(index)).copied().unwrap_or(0.0);
+                    let b = source.and_then(|c| c.get(index.saturating_add(1))).copied().unwrap_or(0.0);
+                    (f64::from(a) * (1.0 - f64::from(fraction)) + f64::from(b) * f64::from(fraction)) as f32
+                };
+                if frame.len() == 1 {
+                    if let Some(value) = frame.first_mut() {
+                        *value = ((f64::from(sample(0)) + f64::from(sample(1))) * 0.5) as f32;
+                    }
+                } else {
+                    for (channel, value) in frame.iter_mut().take(2).enumerate() {
+                        *value = sample(channel);
+                    }
+                }
+                position += step;
+            }
+        });
+        let rate = output.start(fill)?;
+        if rate == 0 {
+            output.stop();
+            return Err("Audio output reported an invalid zero sample rate.".into());
+        }
+        output_rate.store(rate, std::sync::atomic::Ordering::Relaxed);
+        self.playback.audio_clock = false;
+        self.playback.tts_preview = true;
+        Ok(seconds)
+    }
     // ---------------------------------------------------------------- playback
 
     pub fn toggle_play(&mut self, speed: f64) {
@@ -312,6 +380,74 @@ impl FilmcraftApp {
             self.playback.smooth_playhead = Some((self.smooth_playhead(t, now), now));
         }
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod pcm_audition_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    type Fill = Box<dyn FnMut(&mut [f32], usize) + Send>;
+    struct Capture {
+        callback: Arc<Mutex<Option<Fill>>>,
+        fail: bool,
+        rate: u32,
+    }
+    impl crate::AudioOut for Capture {
+        fn sample_rate(&self) -> u32 {
+            48000
+        }
+        fn start(&mut self, fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+            if self.fail {
+                return Err("device unavailable".into());
+            }
+            *self.callback.lock().unwrap() = Some(fill);
+            Ok(self.rate)
+        }
+        fn stop(&mut self) {}
+        fn played_frames(&self) -> Option<u64> {
+            None
+        }
+    }
+    #[test]
+    fn stereo_audition_keeps_left_and_right_distinct_without_project_or_playhead_edits() {
+        let mut s = Session::default();
+        s.execute("file.newSequence", json!({})).unwrap();
+        s.set_playhead(Tick(123456));
+        let mut app = FilmcraftApp::new(s);
+        let before = app.session.project.clone();
+        let playhead = app.session.playhead();
+        let source = app.session.state.source_playhead;
+        let captured = Arc::new(Mutex::new(None));
+        app.audio = Some(Box::new(Capture { callback: captured.clone(), fail: false, rate: 48000 }));
+        let pcm = filmcraft_frame::AudioBuffer { sample_rate: 48000, channels: vec![vec![0.5; 8], vec![0.0; 8]] };
+        app.play_audio_preview(pcm.clone()).unwrap();
+        let mut heard = vec![0.0; 12];
+        captured.lock().unwrap().as_mut().unwrap()(&mut heard, 2);
+        assert!(heard.as_chunks::<2>().0.iter().all(|c| c[0] == 0.5 && c[1] == 0.0));
+        assert_eq!(app.session.project, before);
+        assert_eq!(app.session.playhead(), playhead);
+        assert_eq!(app.session.state.source_playhead, source);
+        app.audio = Some(Box::new(Capture { callback: captured.clone(), fail: false, rate: 24000 }));
+        app.play_audio_preview(filmcraft_frame::AudioBuffer { sample_rate: 48000, channels: vec![(0..8).map(|i| i as f32 * 0.1).collect(), vec![0.0; 8]] })
+            .unwrap();
+        let mut resampled = vec![0.0; 8];
+        captured.lock().unwrap().as_mut().unwrap()(&mut resampled, 2);
+        for (frame, expected) in resampled.as_chunks::<2>().0.iter().zip([0.0, 0.2, 0.4, 0.6]) {
+            assert!((frame[0] - expected).abs() < 1e-6);
+            assert_eq!(frame[1], 0.0);
+        }
+        app.audio = Some(Box::new(Capture { callback: captured.clone(), fail: false, rate: 48000 }));
+        app.play_audio_preview(filmcraft_frame::AudioBuffer { sample_rate: 48000, channels: vec![vec![f32::MAX, -f32::MAX], vec![f32::MAX, -f32::MAX]] })
+            .unwrap();
+        let mut extreme = vec![0.0; 4];
+        captured.lock().unwrap().as_mut().unwrap()(&mut extreme, 1);
+        assert!(extreme.iter().all(|v| v.is_finite()), "extreme finite PCM must not create NaN/Inf during interpolation or mono fold");
+        app.audio = Some(Box::new(Capture { callback: captured, fail: true, rate: 48000 }));
+        assert!(app.play_audio_preview(pcm).unwrap_err().contains("device unavailable"));
+        assert_eq!(app.session.project, before);
+        let bad = filmcraft_frame::AudioBuffer { sample_rate: 48000, channels: vec![vec![f32::NAN]] };
+        assert!(app.play_audio_preview(bad).is_err());
     }
 }
 

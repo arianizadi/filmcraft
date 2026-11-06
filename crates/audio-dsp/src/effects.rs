@@ -1,6 +1,7 @@
 //! Audio effects and their registry.
 
 pub mod channel;
+pub mod channel_router;
 pub mod declick;
 pub mod dynamics;
 pub mod eq;
@@ -17,6 +18,7 @@ pub mod time;
 pub(crate) mod util;
 
 pub use channel::{Amplify, Balance, ChannelVolume, Invert, Route, Routing};
+pub use channel_router::ChannelRouter;
 pub use declick::ClickRemover;
 pub use dynamics::{Compressor, Gate, Limiter};
 pub use eq::{ParametricEq, SimpleEq};
@@ -84,6 +86,7 @@ static REGISTRY: &[EffectInfo] = &[
     entry!("reverb", "Reverb", Time, Reverb),
     entry!("amplify", "Amplify", Channel, Amplify),
     entry!("channel_volume", "Channel Volume", Channel, ChannelVolume),
+    entry!("channel_router", "Channel Router", Channel, ChannelRouter),
     entry!("balance", "Balance / Pan", Channel, Balance),
     entry!("invert", "Invert", Channel, Invert),
     EffectInfo {

@@ -195,7 +195,7 @@ fn fft_filter() -> Vec<ParamDef> {
 
 /// All audio effect definitions, in Effects-panel order.
 pub(super) fn defs() -> Vec<EffectDef> {
-    vec![
+    let mut definitions = vec![
         // ---- Amplitude and Compression ----
         audio("amplify", "Amplify", A_AMP, vec![fs("gain", "Gain", 0.0, (-96.0, 24.0), (-24.0, 24.0), "dB", 1)]),
         audio(
@@ -543,6 +543,23 @@ pub(super) fn defs() -> Vec<EffectDef> {
         audio("vocal_enhancer", "Vocal Enhancer", A_SPECIAL, vec![ch("mode", "Mode", &["Male", "Female", "Music"], 0)]),
         // ---- Stereo Imagery ----
         audio(
+            "channel_router",
+            "Channel Router",
+            A_STEREO,
+            vec![
+                ch(
+                    "mode",
+                    "Mode",
+                    &["Stereo", "Left to Both", "Right to Both", "Mono Average", "Swap", "Mid/Side Encode", "Mid/Side Decode", "Side to Both"],
+                    0,
+                ),
+                db("gain_l_db", "Left Output Gain", 0.0, -60.0, 24.0),
+                db("gain_r_db", "Right Output Gain", 0.0, -60.0, 24.0),
+                b("invert_l", "Invert Left", false),
+                b("invert_r", "Invert Right", false),
+            ],
+        ),
+        audio(
             "stereo_expander",
             "Stereo Expander",
             A_STEREO,
@@ -560,7 +577,32 @@ pub(super) fn defs() -> Vec<EffectDef> {
         audio("balance_a", "Balance", A_ROOT, vec![num("balance", "Balance", 0.0, -100.0, 100.0, "", 1)]),
         audio("mute", "Mute", A_ROOT, vec![mute_param()]),
         audio("volume_a", "Volume", A_ROOT, vec![b("bypass", "Bypass", false), fs("level", "Level", 0.0, (-96.0, 15.0), (-60.0, 15.0), "dB", 1)]),
-    ]
+    ];
+    // Distinct identities let the voice command update its own editable chain without taking
+    // ownership of any EQ/compressor/limiter the editor placed independently.
+    for (id, name, base) in [
+        ("voice_polish_eq", "Voice Polish — Equalizer", "parametric_eq"),
+        ("voice_polish_multiband", "Voice Polish — Four-Band Compressor", "multiband_compressor"),
+        ("voice_polish_limiter", "Voice Polish — Limiter", "hard_limiter"),
+        ("audio_mix_limiter", "Mix Output Limiter", "hard_limiter"),
+    ] {
+        if let Some(mut definition) = definitions.iter().find(|definition| definition.id == base).cloned() {
+            definition.id = id;
+            definition.name = name;
+            if matches!(id, "voice_polish_limiter" | "audio_mix_limiter") {
+                for param in &mut definition.params {
+                    if param.id == "max" {
+                        param.default = crate::ParamValue::Float(if id == "audio_mix_limiter" { -1.5 } else { -1.0 });
+                    }
+                    if param.id == "lookahead" {
+                        param.default = crate::ParamValue::Float(5.0);
+                    }
+                }
+            }
+            definitions.push(definition);
+        }
+    }
+    definitions
 }
 
 fn db_ms_lookahead() -> ParamDef {
@@ -665,5 +707,56 @@ mod tests {
         for id in ["low_freq", "low_gain", "mid_freq", "mid_gain", "mid_q", "high_freq", "high_gain"] {
             assert!(d.param(id).is_some(), "{id}");
         }
+    }
+
+    #[test]
+    fn channel_router_has_stable_modes_and_preserves_existing_mixer_catalogue() {
+        use crate::{ParamValue, effect::ParamKind};
+        let d = find_effect("channel_router").unwrap();
+        assert_eq!(d.kind, EffectKind::Audio);
+        assert_eq!(d.category, A_STEREO);
+        assert_eq!(d.params.len(), 5);
+        let mode = d.param("mode").unwrap();
+        assert_eq!(mode.default, ParamValue::Choice(0));
+        assert_eq!(
+            mode.kind,
+            ParamKind::Choice(&["Stereo", "Left to Both", "Right to Both", "Mono Average", "Swap", "Mid/Side Encode", "Mid/Side Decode", "Side to Both"])
+        );
+        assert!(!mode.animatable);
+        for id in ["gain_l_db", "gain_r_db"] {
+            let p = d.param(id).unwrap();
+            assert_eq!(p.default, ParamValue::Float(0.0));
+            assert!(p.animatable);
+            assert!(matches!(p.kind, ParamKind::Float { min: -60.0, max: 24.0, unit: "dB", .. }));
+        }
+        for id in ["invert_l", "invert_r"] {
+            assert_eq!(d.param(id).unwrap().default, ParamValue::Bool(false));
+        }
+        let effect = d.instance();
+        let encoded = serde_json::to_string(&effect).unwrap();
+        let decoded: crate::effect::EffectInstance = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, effect);
+        let old_mixer = find_effect("channel_mixer_a").unwrap();
+        assert!(old_mixer.param("l_from_l").is_some());
+        assert!(old_mixer.param("mode").is_none());
+    }
+
+    #[test]
+    fn owned_voice_and_mix_aliases_are_editable_without_changing_existing_effects() {
+        for (id, base) in [("voice_polish_eq", "parametric_eq"), ("voice_polish_multiband", "multiband_compressor")] {
+            let owned = find_effect(id).unwrap();
+            let existing = find_effect(base).unwrap();
+            assert_eq!(owned.kind, EffectKind::Audio);
+            assert_eq!(owned.params, existing.params);
+            assert_ne!(owned.id, existing.id);
+        }
+        for (id, ceiling) in [("voice_polish_limiter", -1.0), ("audio_mix_limiter", -1.5)] {
+            let owned = find_effect(id).unwrap().instance();
+            assert_eq!(owned.f64_at("max", crate::Tick::ZERO), ceiling);
+            assert_eq!(owned.f64_at("boost", crate::Tick::ZERO), 0.0);
+            assert_eq!(owned.f64_at("lookahead", crate::Tick::ZERO), 5.0);
+            assert!(find_effect(id).unwrap().param("release").unwrap().animatable);
+        }
+        assert_eq!(find_effect("hard_limiter").unwrap().instance().f64_at("max", crate::Tick::ZERO), -0.1);
     }
 }

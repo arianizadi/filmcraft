@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{AutomationError, BridgeClient, png_rgba};
 
+mod audio;
 mod workflow;
 use workflow::{
     ApplyParams, DeliverEditParams, DescribeParams, Effects, FootageAnalysisParams, FramesParams, GetOperationParams, GradeAddress, GradeCopyParams,
@@ -592,6 +593,135 @@ impl FilmcraftMcp {
     }
 
     #[tool(
+        title = "Inspect clip audio routing",
+        description = "Inspect selected or explicit audio clips, their source streams/channel selections, and the distinct repair router. Selecting an audio clip leaves other linked camera/scratch streams alone.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_channels_get(&self, Parameters(p): Parameters<audio::Selection>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.channels.get", p).await)
+    }
+
+    #[tool(
+        title = "Measure audio channels and loudness",
+        description = "Bounded read-only source, isolated clip or sequence measurements: channel levels, DC, full-scale/headroom risk, stereo/mono compatibility and BS.1770 loudness. Defaults to first30s; explicit windows max300s. Float headroom is preserved. Coverage and processing boundaries are explicit.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_inspect(&self, Parameters(p): Parameters<audio::Inspect>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.inspect", p).await)
+    }
+
+    #[tool(
+        title = "Analyze audio in the background",
+        description = "Start bounded snapshot audio inspection with Propose/Edit permission. Returns stable job/progress/cancellation and input revision; poll audio_inspect_status. Does not change the timeline or source files.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn audio_inspect_start(&self, Parameters(p): Parameters<audio::Inspect>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.inspectAsync", p).await)
+    }
+
+    #[tool(
+        title = "Poll audio analysis",
+        description = "Read the originating document's snapshot analysis result or progress. Job cancellation uses jobs.cancel. Reopening a document does not expose another document's analysis.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_inspect_status(&self, Parameters(p): Parameters<audio::Job>) -> Result<CallToolResult, McpError> {
+        wrap(self.run("audio.inspectStatus", json!({"job":p.job})).await)
+    }
+
+    #[tool(
+        title = "Audition exact audio snapshots",
+        description = "Return short unclipped IEEE-float32 WAV audio blocks with revision/time metadata. Default5s,max10s. Compare a frozen plan's before/after audio without applying it or seeking the desktop. Playback devices can clip above unity; inspect headroom and choose safe monitoring gain.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_preview(&self, Parameters(p): Parameters<audio::Inspect>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        match self.run("audio.preview", p).await {
+            Ok(v) => Ok(audio::audition(v)),
+            Err(e) => wrap(Err(e)),
+        }
+    }
+
+    #[tool(
+        title = "Prepare an audio repair proposal",
+        description = "Prepare an isolated one-undo-step proposal for selected audio: conservative one-sided mic routing, optional voice preset and full-clip peak-limited loudness. Stereo is preserved unless explicitly selected or clear missing-channel evidence exists. Audition before/after, then approve with apply_plan. No source writes.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn prepare_audio(&self, Parameters(p): Parameters<audio::Repair>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.prepare", p).await)
+    }
+
+    #[tool(
+        title = "Inspect microphone mix roles",
+        description = "Read-only measured microphone/backup/music role inspection. Uses explicit disjoint audio clip IDs; does not guess hardware identity or combine duplicate camera and wireless microphones. Inspect the proposed roles before preparing a mix.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_mix_inspect(&self, Parameters(p): Parameters<audio::Mix>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.mix.inspect", p).await)
+    }
+
+    #[tool(
+        title = "Prepare microphone mix automation",
+        description = "Stage explicit main/backup/music roles: retain muted camera backup, conservative one-sided repair, editable native voice EQ/multiband/limiting, peak-constrained clip loudness and optional music ducking from only the chosen microphones. Preserves user effects/animation; replacing affected automation needs consent. Audition the frozen sequence before/after and approve as one undo step. Final summed mix/export still needs peak verification.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn prepare_audio_mix(&self, Parameters(p): Parameters<audio::Mix>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.mix.prepare", p).await)
+    }
+
+    #[tool(
+        title = "Inspect camera and microphone synchronization",
+        description = "Match camera scratch audio and an external mic using waveform correlation (including claps), or exact manual SOURCE-time anchors. Returns offset/confidence/coverage and precise move/trim warnings. Ambiguous waveforms require manual anchors. No edits; original camera position stays fixed.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn audio_sync_inspect(&self, Parameters(p): Parameters<audio::Sync>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.sync.inspect", p).await)
+    }
+
+    #[tool(
+        title = "Prepare microphone synchronization",
+        description = "Stage a reviewed camera/external-mic alignment. Moves target linked partners together, rejects locks/collisions/transitions, and reports leading trim when audio would begin before zero. Optional reference muting affects scratch audio only. Preview/audition and approve as one undo step.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn prepare_audio_sync(&self, Parameters(p): Parameters<audio::Sync>) -> Result<CallToolResult, McpError> {
+        let p = match audio::params(&p) {
+            Ok(p) => p,
+            Err(e) => return Ok(fail(e)),
+        };
+        wrap(self.run("audio.sync.prepare", p).await)
+    }
+
+    #[tool(
         title = "Prepare footage for automatic review",
         description = "Start bounded background preparation of original paths or imported sources with Propose/Edit permission. Returns a durable job; poll prepare_status/jobs.get until the resulting plan is ready, then preview exact frames and approve. Source files stay unchanged; no automatic downloads. Preparation always leaves apply false.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
@@ -1022,7 +1152,7 @@ impl FilmcraftMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "FilmCraft: inspect -> propose -> preview -> apply -> verify. Start with agent_session and inspect (doc_inspect also returns the project tree). Build eligible in-memory edits with plan_edit, inspect preview_plan, then render_frames with plan/comparison and scopes.read. Apply only the user-approved plan using apply_plan with stable operation_id/idempotency_key/session_id; verify the receipt, affected IDs, scopes and frames. A stale plan must be rebuilt. Resolve lost replies with get_operation; unknown_commit never means safe to repeat a write under another ID. command_run and UI tools remain advanced direct editing tools and require Edit permission. File writes and jobs stay outside edit plans. Time is exact ticks (254016000000/s) or frame indexes.";
+const INSTRUCTIONS: &str = "FilmCraft: inspect -> propose -> preview -> apply -> verify. Start with agent_session and inspect (doc_inspect also returns the project tree). Build eligible in-memory edits with plan_edit, inspect preview_plan, then render_frames with plan/comparison and scopes.read. Apply only the user-approved plan using apply_plan with stable operation_id/idempotency_key/session_id; verify the receipt, affected IDs, scopes and frames. A stale plan must be rebuilt. Resolve lost replies with get_operation; unknown_commit never means safe to repeat a write under another ID. command_run and UI tools remain advanced direct editing tools and require Edit permission. File writes and jobs stay outside edit plans. For audio, inspect channels/native streams with audio_channels_get and audio_inspect; stage conservative repair with prepare_audio, align camera/microphone with prepare_audio_sync, and audition frozen before/after float WAVs with audio_preview. Select main and scratch streams explicitly; preserve genuine stereo and float headroom. Ambiguous synchronization requires exact source-time clap anchors. Time is exact ticks (254016000000/s) or frame indexes.";
 
 /// Resources: the project (as `doc_inspect`) and the command catalog (as `command_list`).
 const DOCUMENT_URI: &str = "filmcraft://document";

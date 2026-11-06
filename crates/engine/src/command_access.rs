@@ -7,6 +7,13 @@
 use serde_json::Value;
 
 const READ_ONLY: &[&str] = &[
+    "audio.channels.get",
+    "audio.inspect",
+    "audio.inspectStatus",
+    "audio.preview",
+    "audio.sync.inspect",
+    "audio.voice.recipe",
+    "audio.mix.inspect",
     "analysis.footage",
     "workflow.status",
     "motion.templates",
@@ -125,6 +132,10 @@ const OPTIONAL_OUTPUT: &[&str] = &["lumetri.presetThumbnails", "graphics.templat
 // These historically carry journal:false. They must never inherit query access from that flag.
 #[cfg(test)]
 const SIDE_EFFECT_QUERIES: &[&str] = &[
+    "audio.inspectAsync",
+    "audio.prepare",
+    "audio.sync.prepare",
+    "audio.mix.prepare",
     "library.model.download",
     "library.model.load",
     "library.model.unload",
@@ -193,6 +204,10 @@ pub fn is_proposal(id: &str) -> bool {
     matches!(
         id,
         "agent.plan"
+            | "audio.prepare"
+            | "audio.inspectAsync"
+            | "audio.sync.prepare"
+            | "audio.mix.prepare"
             | "library.model.load"
             | "library.indexAsync"
             | "agent.discard"

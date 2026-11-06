@@ -14,7 +14,13 @@ pub mod aaf_omf;
 pub mod agent_inspect;
 pub mod agent_plans;
 mod analysis_support;
+pub mod audio_channels;
+pub mod audio_inspect;
 pub mod audio_jobs;
+pub mod audio_mix;
+pub mod audio_output;
+pub mod audio_sync;
+pub mod audio_voice;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
@@ -492,6 +498,7 @@ pub struct Session {
     pub library_index: library_search::IndexStore,
     pub model_jobs: library_model::ModelJobs,
     pub workflow_tasks: workflow_async::Tasks,
+    pub audio_inspect_tasks: audio_inspect::Tasks,
     pub services: Arc<dyn Services>,
     pub events: Vec<Event>,
     /// Commands executed (for macros/debugging): (id, params).
@@ -608,6 +615,18 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Runtime allocation floor retained after undo. Hosts copying an immutable project into a
+    /// proposal worker must carry this floor too, so retired effect identities stay retired.
+    pub fn effect_identity_floor(&self) -> u64 {
+        self.effect_identity_floor
+    }
+
+    /// Carry an originating session's effect identity floor into a background proposal session.
+    /// This only raises the floor; it never mutates a project or reuses an allocated identity.
+    pub fn inherit_effect_identity_floor(&mut self, minimum: u64) {
+        self.effect_identity_floor = self.effect_identity_floor.max(minimum);
+    }
+
     pub fn new(services: Arc<dyn Services>) -> Self {
         Self {
             project: Arc::new(Project::new("Untitled")),
@@ -632,6 +651,7 @@ impl Session {
             library_index: Default::default(),
             model_jobs: Default::default(),
             workflow_tasks: Default::default(),
+            audio_inspect_tasks: Default::default(),
             services,
             events: Vec::new(),
             journal: Vec::new(),

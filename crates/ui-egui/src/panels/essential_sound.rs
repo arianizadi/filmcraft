@@ -1,9 +1,9 @@
 //! Essential Sound panel: Browse / Edit tabs, audio-type assignment, per-type collapsible sections
 //! (Loudness, Repair, Clarity, Creative, Ducking, Duration, Pan) with switch + slider rows, presets,
-//! and the Clip Volume / Mute footer. Every control runs an `essentialSound.*` command (slider drags
-//! are one undo step), so the panel, MCP and the control channel share one code path.
+//! and the Clip Volume / Mute footer. Existing controls run `essentialSound.*` commands (slider
+//! drags are one undo step). Channels & Tools delegates `audio.*` commands to `audio_tools`.
 //!
-//! Automation ids: `essentialSound.tab.<Browse|Edit>`, `essentialSound.type.<Dialogue|Music|SFX|
+//! Automation ids: `essentialSound.tab.<Browse|Edit|Tools>`, `essentialSound.type.<Dialogue|Music|SFX|
 //! Ambience>`, `essentialSound.clearType`, `essentialSound.preset` (+ `.save`, `.delete`,
 //! `.name`, `.ok`), `essentialSound.section.<Name>` (twirl) and `.toggle` (switch), setting rows by
 //! key (`essentialSound.repair.noise.on`, `essentialSound.repair.noise.amount`,
@@ -52,31 +52,39 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let items: Vec<TrackItem> =
         app.session.active_sequence().map(|seq| clip_ids.iter().filter_map(|c| seq.find_item(*c).map(|(_, i)| i.clone())).collect()).unwrap_or_default();
     let presets = filmcraft_engine::essential_sound::presets(&app.session);
-    let tab = if app.ui.essential_sound_tab == "Browse" { "Browse" } else { "Edit" };
-    let mut cx = Ctx { t, auto: &mut app.auto, actions: Vec::new(), clips: clip_ids.iter().map(|c| c.0).collect() };
+    let tab = match app.ui.essential_sound_tab.as_str() {
+        "Browse" => "Browse",
+        "Tools" => "Tools",
+        _ => "Edit",
+    };
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, t.panel_bg);
-    // ---- Browse | Edit
-    let mut x = rect.min.x + PAD;
-    let ty = rect.min.y + 16.0;
+    // Wrapped tabs retain all three entries even in a narrow dock.
     let mut new_tab = None;
-    for name in ["Browse", "Edit"] {
-        let shown = if name == "Browse" { tl!("Browse") } else { tl!("Edit") };
-        let g = painter.layout_no_wrap(shown.to_string(), Tokens::ui(12.5), t.text);
-        let r = Rect::from_min_size(pos2(x, ty - 9.0), vec2(g.size().x, 20.0));
-        let resp = ui.interact(r, egui::Id::unique(("es-tab", name)), Sense::click());
-        let col = if name == tab || resp.hovered() { t.text } else { t.text_dim };
-        painter.text(pos2(x, ty), Align2::LEFT_CENTER, shown, Tokens::ui(12.5), col);
-        if name == tab {
-            painter.line_segment([pos2(x, ty + 10.0), pos2(x + g.size().x, ty + 10.0)], Stroke::new(1.5, t.text));
+    let mut header = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(PAD, 4.0))).id_salt("es-tabs"));
+    let tabs = header.horizontal_wrapped(|ui| {
+        for name in ["Browse", "Edit", "Tools"] {
+            let label = match name {
+                "Browse" => tl!("Browse"),
+                "Edit" => tl!("Edit"),
+                _ => "Channels & Tools",
+            };
+            let response = ui.selectable_label(name == tab, label);
+            app.auto.add_response(&format!("essentialSound.tab.{name}"), &response, label);
+            if response.clicked() {
+                new_tab = Some(name.to_string());
+            }
         }
-        cx.auto.add(&format!("essentialSound.tab.{name}"), r, name);
-        if resp.clicked() {
-            new_tab = Some(name.to_string());
+    });
+    let body = Rect::from_min_max(pos2(rect.min.x, (tabs.response.rect.max.y + 6.0).min(rect.max.y)), rect.max);
+    if tab == "Tools" {
+        super::audio_tools::show(app, ui, body);
+        if let Some(n) = new_tab {
+            app.ui.essential_sound_tab = n;
         }
-        x += g.size().x + 22.0;
+        return;
     }
-    let body = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 32.0), rect.max);
+    let mut cx = Ctx { t, auto: &mut app.auto, actions: Vec::new(), clips: clip_ids.iter().map(|c| c.0).collect() };
     if tab == "Browse" {
         browse(ui, &mut cx, body, &presets, &items);
     } else {

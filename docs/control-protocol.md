@@ -238,3 +238,13 @@ resizes the root split; path entries use `false` for the first child and `true` 
 the second. `{"action":{"MoveFloating":{"panel":"Info","rect":[45,65,420,320]}}}`
 repositions and resizes the floating group containing Info. Invalid actions leave the
 layout unchanged. Pointer gestures dispatch through this same catalog command.
+
+## Audio review workflow
+
+`audio.channels.get/set/reset`, `audio.source.set`, `audio.streams.configure`, `audio.preset`,
+`audio.normalize` and `audio.prepare` provide typed non-destructive microphone control.
+`audio.inspect`, `audio.inspectAsync`, `audio.inspectStatus` and `audio.preview` read bounded
+source/clip/sequence snapshots. `audio.sync.inspect/prepare` stage waveform/manual alignment.
+`audio.voice.polish` and `audio.mix.inspect/prepare` expose editable voice recipes and explicit
+main/backup/music automation. See [audio-workflow.md](audio-workflow.md) for parameters, bounds,
+clock-drift and final-mix limits. UI controls use `essentialSound.tab.Tools` and `audioTools.*`.

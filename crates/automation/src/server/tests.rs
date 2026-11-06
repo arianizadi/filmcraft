@@ -556,6 +556,12 @@ fn automatic_tools_expose_strict_complete_schemas() {
                 "overrides",
                 "analyze",
                 "normalize_audio",
+                "repair_channels",
+                "polish_voice",
+                "main_audio_stream",
+                "secondary_audio",
+                "voice_tone",
+                "voice_intensity",
                 "captions",
                 "apply",
                 "transcribe",
@@ -600,6 +606,9 @@ fn automatic_tools_expose_strict_complete_schemas() {
     let schema = Value::Object((*m.tool_router.get("prepare_footage").unwrap().input_schema).clone());
     assert_eq!(schema["properties"]["max_shots"]["minimum"], 1);
     assert_eq!(schema["properties"]["max_shots"]["maximum"], 96);
+    assert_eq!(schema["properties"]["main_audio_stream"]["maximum"], 63);
+    assert_eq!(schema["properties"]["voice_intensity"]["minimum"], 0);
+    assert_eq!(schema["properties"]["voice_intensity"]["maximum"], 1);
     assert_eq!(schema["properties"]["apply"]["enum"], json!([false, null]));
     let text = schema.to_string();
     for value in ["talkingHead", "selects", "rec2100-pq", "referenceLook", "captionStyle", "fpsNum", "background_color"] {
@@ -617,7 +626,7 @@ fn automatic_tools_preserve_omission_false_zero_and_nullable_profile_fields() {
     assert_eq!(workflow::engine_params(&empty).unwrap(), json!({}), "unset flags retain engine defaults");
     let input = json!({"items":[1,2],"paths":["/a.mov"],"profile":"Studio","mode":"dj","music_item":2,"name":"Cut","max_shots":9,"target_duration_ticks":254016000000_i64,
         "overrides":{"referenceLook":null,"pausePaddingTicks":0,"loudnessLufs":-18.0,"captionStyle":{"background":false,"line_spacing":1.3,"color":[1,2,3,255]},"delivery":{"fpsNum":24,"fpsDen":1,"colorSpace":"rec2100-hlg","captions":"none"}},
-        "analyze":false,"normalize_audio":false,"captions":false,"apply":false,"transcribe":false,"qc":false});
+        "analyze":false,"normalize_audio":false,"repair_channels":false,"polish_voice":false,"main_audio_stream":0,"secondary_audio":"keep","voice_tone":"bright","voice_intensity":0,"captions":false,"apply":false,"transcribe":false,"qc":false});
     let p: PrepareFootageParams = serde_json::from_value(input.clone()).unwrap();
     let mapped = workflow::engine_params(&p).unwrap();
     assert_eq!(mapped["mode"], "dj");
@@ -625,7 +634,11 @@ fn automatic_tools_preserve_omission_false_zero_and_nullable_profile_fields() {
     assert_eq!(mapped["maxShots"], 9);
     assert_eq!(mapped["targetDurationTicks"], 254016000000_i64);
     assert_eq!(mapped["overrides"], input["overrides"]);
-    for flag in ["analyze", "normalizeAudio", "captions", "apply", "transcribe", "qc"] {
+    assert_eq!(mapped["mainAudioStream"], 0);
+    assert_eq!(mapped["secondaryAudio"], "keep");
+    assert_eq!(mapped["voiceTone"], "bright");
+    assert_eq!(mapped["voiceIntensity"].as_f64(), Some(0.0));
+    for flag in ["analyze", "normalizeAudio", "repairChannels", "polishVoice", "captions", "apply", "transcribe", "qc"] {
         assert_eq!(mapped[flag], false, "{mapped}");
     }
     assert!(mapped.get("music_item").is_none());

@@ -42,7 +42,7 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
                 d.set_param("release", f(e, "release", t));
             },
         },
-        "hard_limiter" => Mapping {
+        "hard_limiter" | "voice_polish_limiter" | "audio_mix_limiter" => Mapping {
             dsp: "limiter",
             preroll: |e, t| (f(e, "release", t) as f64 / 1000.0 * 5.0).clamp(0.05, 2.0),
             apply: |d, e, t| {
@@ -201,10 +201,12 @@ pub(crate) fn mapping(id: &str) -> Option<Mapping> {
 /// Project effects whose parameters map one-to-one (same ids, same units) onto a DSP effect:
 /// (project id, DSP id, pre-roll seconds for a fresh chain).
 pub const DIRECT: &[(&str, &str, f64)] = &[
+    ("channel_router", "channel_router", 0.0),
     ("channel_mixer_a", "channel_mixer", 0.0),
     ("channel_volume_a", "channel_volume", 0.0),
     ("dynamics_rack", "dynamics_rack", 1.0),
     ("multiband_compressor", "multiband_compressor", 1.0),
+    ("voice_polish_multiband", "multiband_compressor", 1.0),
     ("tube_compressor", "tube_compressor", 1.5),
     ("fft_filter", "fft_filter", 0.1),
     ("graphic_eq", "graphic_eq_10", 0.1),
@@ -212,6 +214,7 @@ pub const DIRECT: &[(&str, &str, f64)] = &[
     ("graphic_eq_30", "graphic_eq_30", 0.1),
     ("notch", "notch_filter", 0.1),
     ("parametric_eq", "parametric_eq_full", 0.1),
+    ("voice_polish_eq", "parametric_eq_full", 0.1),
     ("scientific_filter", "scientific_filter", 0.2),
     ("chorus_flanger", "chorus_flanger", 0.1),
     ("flanger", "flanger", 0.2),
@@ -320,6 +323,10 @@ fn cache() -> &'static Mutex<HashMap<Key, Vec<Chain>>> {
 fn structure_hash(item: &TrackItem) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    // A new input selection/timing starts a new DSP history. Continuing a delay/noise-reduction
+    // chain from the previous microphone would leak its tail into the newly chosen source.
+    (item.item, item.start, item.duration, item.source_in, item.speed.to_bits(), item.reverse, item.audio_stream).hash(&mut h);
+    item.source_channels.hash(&mut h);
     for (e, m) in active(item) {
         e.effect.hash(&mut h);
         m.dsp.hash(&mut h);
@@ -404,6 +411,46 @@ mod tests {
     use super::*;
     use filmcraft_audio_dsp::Unit;
     use filmcraft_project::{EffectKind, ParamKind, effect_defs};
+
+    #[test]
+    fn changing_source_stream_or_channels_clears_prior_microphone_effect_history() {
+        for switch_stream in [true, false] {
+            let mut project = filmcraft_project::Project::default();
+            let source = project.new_sequence("Mic", Default::default(), 1, 1, None);
+            let mut item = project
+                .make_track_item(
+                    source,
+                    filmcraft_project::TrackKind::Audio,
+                    Tick::ZERO,
+                    filmcraft_time::TimeRange::new(Tick::ZERO, Tick::from_units(1, 1)),
+                    filmcraft_time::FrameRate::FPS_24,
+                )
+                .unwrap();
+            item.id = filmcraft_project::ClipId(98_765 + u64::from(switch_stream));
+            let mut delay = filmcraft_project::find_effect("delay").unwrap().instance();
+            for (key, value) in [("delay", 0.01), ("mix", 100.0), ("feedback", 0.0)] {
+                delay.params.get_mut(key).unwrap().value = filmcraft_project::ParamValue::Float(value);
+            }
+            item.effects.push(delay);
+            let impulse = |start: i64, n: usize| {
+                let mut out = vec![vec![0.0; n]; 2];
+                if start <= 0 && start.saturating_add(n as i64) > 0 {
+                    for ch in &mut out {
+                        ch[(-start) as usize] = 0.8;
+                    }
+                }
+                out
+            };
+            let _ = process(&item, 0, 240, 48_000, &impulse);
+            if switch_stream {
+                item.audio_stream = 1;
+            } else {
+                item.source_channels = vec![1];
+            }
+            let silent = process(&item, 240, 720, 48_000, &|_, n| vec![vec![0.0; n]; 2]);
+            assert!(silent.iter().flatten().all(|v| v.abs() < 1e-8), "old mic tail leaked after changing input selection");
+        }
+    }
 
     #[test]
     fn every_audio_effect_has_dsp() {

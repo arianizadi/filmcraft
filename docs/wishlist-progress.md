@@ -1,6 +1,6 @@
 # Personal editing wishlist implementation
 
-This tracks the requested wishlist against executable behavior and review evidence. A feature is checked only after implementation, integration and validation. The foundation shipped in `66ce2e8f`; the expanded implementation is `0.17.1-arian.2`, including upstream main through `ba8d04a3`. Explicit algorithm, verification and legacy API limits are recorded below and in the linked guides.
+This tracks the requested wishlist against executable behavior and review evidence. A feature is checked only after implementation, integration and validation. The foundation shipped in `66ce2e8f`; the expanded implementation is `0.17.1-arian.3`, including upstream main through `ba8d04a3`. Explicit algorithm, verification and legacy API limits are recorded below and in the linked guides.
 
 ## Safety and agent control
 
@@ -28,6 +28,23 @@ This tracks the requested wishlist against executable behavior and review eviden
 - [x] Individual client pairing and project-scoped media/output folder grants across generic/UI routes.
 - [x] Durable job IDs, input revision/progress/cancellation and interrupted-after-restart status.
 - [x] One entry point to prepare footage, propose an automatic edit and verify its delivery using the above tools.
+
+## Microphone and audio workflow
+
+- [x] Read-only source/clip/sequence audio diagnostics, bounded background jobs and exact frozen float-WAV before/after auditions.
+- [x] Left/right-to-both, mono, swap, polarity, independent output gain and mid/side routing with typed readback and animation guards.
+- [x] Explicit native container-stream and source-channel selection; main/backup roles retain recordings and video unchanged.
+- [x] Complete post-effects clip loudness normalization with measured true-peak headroom and preserved Volume animation.
+- [x] Waveform/clap synchronization and exact source-time anchors, visible confidence/ambiguity, linked-target moves and one-undo proposals.
+- [x] PCM24 and float32 WAV import/preview/export tests, including recoverable samples above unity.
+- [x] Editable neutral/warm/bright native voice EQ, four-band dynamics and limiter recipes, integrated into talking-head proposals.
+- [x] Explicit microphone/backup/music mix proposals, selected-mic music ducking and an owned post-fader output limiter.
+- [x] Native Channels & Tools workbench, source-stream selection, background preparation and before/after listening.
+
+See [audio-workflow.md](audio-workflow.md) and [audio-analysis.md](audio-analysis.md). Native codec
+support and correct float handling do not imply analogue clipping recovery or automatic clock-drift
+correction. Final summed mix and exported-file verification remain separate from individual clip
+normalization. Private recordings and the user-requested tutorial transcript stay local.
 
 ## Engine milestones
 
@@ -73,6 +90,26 @@ laptop/desk scene above unrelated forest/crowd descriptions. The automatic entry
 passed native QC and replayed delivery with the same job. Footage never left the Mac. Reports,
 images, projects and commands live in the local Desktop `FilmCraft Tests` folder; private footage
 and derived images are not committed.
+
+## Validation for the microphone workflow
+
+`CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 cargo xtask ci` passed with5,032 successful test
+executions,56 ignored cases, workspace formatting/all-target Clippy, dependency layers,
+61 asset attributions and50-crate WASM checking. The optimized Apple Silicon app/CLI build passed.
+Independent reviews and native regressions cover stream isolation, animation consent, inactive
+Volume, exact plan identities, frozen native A/B, repetitive sync ambiguity and final output inserts.
+
+The generated + actual typed-MCP harness passed on all four newly supplied Desktop recordings
+with unchanged full SHA-256/stat identities. It verified real two-stream8K59.94 AAC and stereo/four-
+channel48kHz float32 WAV selection, retained backups, one undo, idempotent replay and stale refusal.
+Generated PCM24 and hot float32 WAV tests retained samples above unity; peak-constrained Int24
+export measured approximately-1.000002dBTP. The requested-16LUFS target remained unattainable for
+that high-crest fixture and the report preserved the peak ceiling. Music ducking produced12dB
+attenuation relative to its normalized base, with explicit consent required to replace existing keys.
+The actual three-second mix preview measured-1.6076dBTP. A second actual sync candidate remained
+ambiguous and automatic alignment was refused. These are bounded correctness tests, not long-take
+clock-drift, acoustic-quality or sustained8K throughput certification. All private media, previews,
+full transcript downloads and reports remain in the local Desktop test folder.
 
 ## Explicit limits
 

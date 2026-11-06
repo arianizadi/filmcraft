@@ -281,3 +281,171 @@ fn newly_recognized_existing_sources_stage_the_transcript_with_the_proposal() {
     s.execute("agent.apply", json!({"plan":proposal["plan"]})).unwrap();
     assert_eq!(s.project, after);
 }
+
+struct WorkflowAudioStreams {
+    picture: filmcraft_media::SharedSource,
+    info: filmcraft_media::MediaInfo,
+    reads: std::sync::Arc<[std::sync::atomic::AtomicUsize; 2]>,
+}
+impl filmcraft_media::MediaSource for WorkflowAudioStreams {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, request: filmcraft_media::FrameRequest) -> filmcraft_media::Result<std::sync::Arc<filmcraft_frame::VideoFrame>> {
+        self.picture.video_frame(request)
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        self.audio_stream(0, start, frames, rate)
+    }
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        assert!(stream < self.info.audio_streams.len(), "selected nonexistent stream {stream}");
+        self.reads[stream].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let amplitude = if stream == 0 { 0.02 } else { 0.12 };
+        let signal: Vec<_> = (0..frames)
+            .map(|i| {
+                let sample = start + i as i64;
+                if sample < 0 || sample >= i64::from(rate) {
+                    0.0
+                } else {
+                    (std::f64::consts::TAU * 550.0 * sample as f64 / f64::from(rate)).sin() as f32 * amplitude
+                }
+            })
+            .collect();
+        Ok(filmcraft_frame::AudioBuffer { sample_rate: rate, channels: vec![signal.clone(), signal] })
+    }
+}
+
+fn workflow_stream_source(streams: usize, split_primary: bool) -> (Session, u64, std::sync::Arc<[std::sync::atomic::AtomicUsize; 2]>) {
+    use filmcraft_engine::project::{AudioChannelMap, AudioChannels, ItemId};
+    let mut s = Session::default();
+    let item = s.execute("file.newBarsAndTone", json!({"seconds":1,"width":64,"height":64})).unwrap()["item"].as_u64().unwrap();
+    let picture = s.source(ItemId(item)).unwrap();
+    let mut info = picture.info().clone();
+    info.audio_streams = vec![info.audio_streams[0].clone(); streams];
+    let reads = std::sync::Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)));
+    let source = std::sync::Arc::new(WorkflowAudioStreams { picture, info: info.clone(), reads: reads.clone() });
+    let media = std::sync::Arc::make_mut(&mut s.project).item_mut(ItemId(item)).unwrap().as_media_mut().unwrap();
+    media.info = info;
+    if split_primary {
+        media.interpret.audio_channels = Some(AudioChannelMap { format: AudioChannels::Mono, clips: vec![vec![0], vec![1]] });
+    }
+    s.media.insert(ItemId(item), source);
+    (s, item, reads)
+}
+
+fn workflow_volume(clip: &filmcraft_engine::project::TrackItem) -> f64 {
+    clip.effect("volume").unwrap().param("level").unwrap().value.as_f64().unwrap()
+}
+
+#[test]
+fn automatic_main_stream_binding_follows_primary_channel_map_and_normalizes_only_that_stream() {
+    use filmcraft_engine::project::AudioType;
+    let (mut s, item, reads) = workflow_stream_source(2, true);
+    let before = s.project.clone();
+    let revision = s.revision;
+    let undo = s.history.undo.len();
+    let proposal = s
+        .execute(
+            "workflow.autoEdit",
+            json!({"items":[item],"mainAudioStream":1,"secondaryAudio":"mute",
+        "analyze":false,"repairChannels":false,"polishVoice":false,"normalizeAudio":true,"captions":false,"qc":false,
+        "overrides":{"loudnessLufs":-42}}),
+        )
+        .unwrap();
+    assert_eq!(s.project, before);
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.undo.len(), undo);
+    let commands = proposal["commands"].as_array().unwrap();
+    let placement = commands.iter().position(|step| step["id"] == "timeline.place").unwrap();
+    let normalization = commands.iter().find(|step| step["id"] == "workflow.normalizeAudio").unwrap();
+    assert_eq!(
+        normalization["params"]["clips"],
+        json!([{"$step":placement,"path":"/clips/3"}]),
+        "video is first, two mapped stream-0 clips precede the native stream-1 clip"
+    );
+    let (plan, state, _) = s.agent_plan_snapshot(proposal["plan"].as_u64().unwrap(), false).unwrap();
+    let sequence = plan.sequence(state.active_sequence.unwrap()).unwrap();
+    assert_eq!(sequence.video_tracks.iter().map(|t| t.items.len()).sum::<usize>(), 1);
+    assert!(sequence.video_tracks.iter().flat_map(|t| &t.items).all(|clip| clip.enabled));
+    let audio: Vec<_> = sequence.audio_tracks.iter().flat_map(|t| &t.items).collect();
+    assert_eq!(audio.len(), 3);
+    assert_eq!(audio[0].audio_stream, 0);
+    assert_eq!(audio[0].source_channels, vec![0]);
+    assert_eq!(audio[1].audio_stream, 0);
+    assert_eq!(audio[1].source_channels, vec![1]);
+    for backup in audio.iter().filter(|clip| clip.audio_stream == 0) {
+        assert!(!backup.enabled, "backup source streams are retained and muted");
+        assert!(backup.essential.is_none(), "backup never receives main-stream dialogue processing");
+        assert_eq!(workflow_volume(backup), 0.0);
+    }
+    let main = audio.iter().find(|clip| clip.audio_stream == 1).unwrap();
+    assert!(main.enabled && main.source_channels.is_empty());
+    assert_eq!(main.essential.as_ref().unwrap().kind, AudioType::Dialogue);
+    assert!(workflow_volume(main) < -1.0, "the -42 LUFS request must reach actual Volume normalization");
+    assert!(reads[1].load(std::sync::atomic::Ordering::Relaxed) > 0, "main stream was measured");
+    assert_eq!(reads[0].load(std::sync::atomic::Ordering::Relaxed), 0, "mapped backups were never measured or normalized");
+    s.execute("agent.apply", json!({"plan":proposal["plan"]})).unwrap();
+    assert_eq!(s.project, plan);
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project, before);
+}
+
+#[test]
+fn automatic_missing_main_stream_falls_back_explicitly_and_still_retains_one_undo() {
+    let (mut s, item, reads) = workflow_stream_source(1, false);
+    let before = s.project.clone();
+    let revision = s.revision;
+    let undo = s.history.undo.len();
+    let proposal = s
+        .execute(
+            "workflow.autoEdit",
+            json!({"items":[item],"mainAudioStream":1,"analyze":false,
+        "repairChannels":false,"polishVoice":false,"normalizeAudio":true,"captions":false,"qc":false,"overrides":{"loudnessLufs":-42}}),
+        )
+        .unwrap();
+    assert_eq!(s.project, before);
+    assert_eq!(s.revision, revision);
+    assert!(
+        proposal["workflow"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .any(|warning| warning.contains("no audio stream 1") && warning.contains("stream0")),
+        "{proposal}"
+    );
+    let (plan, state, _) = s.agent_plan_snapshot(proposal["plan"].as_u64().unwrap(), false).unwrap();
+    let audio: Vec<_> = plan.sequence(state.active_sequence.unwrap()).unwrap().audio_tracks.iter().flat_map(|track| &track.items).collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0].audio_stream, 0);
+    assert!(audio[0].enabled);
+    assert!(workflow_volume(audio[0]) < -1.0);
+    assert!(reads[0].load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(reads[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+    s.execute("agent.apply", json!({"plan":proposal["plan"]})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project, before);
+}
+
+#[test]
+fn automatic_long_dialogue_skips_unbounded_channel_repair_and_loudness_without_losing_the_proposal() {
+    let mut s = Session::default();
+    let item = s.execute("file.newBarsAndTone", json!({"seconds":301,"width":64,"height":64})).unwrap()["item"].as_u64().unwrap();
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    let proposal = s.execute("workflow.autoEdit", json!({"items":[item],"analyze":false,"polishVoice":false,"captions":false,"qc":false})).unwrap();
+    assert_eq!(s.project, before);
+    assert!(!proposal["commands"].as_array().unwrap().iter().any(|c| c["id"] == "audio.channels.set"));
+    assert!(proposal["workflow"]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().is_some_and(|s| s.contains("300s") && s.contains("skipped"))));
+    let (after, state, _) = s.agent_plan_snapshot(proposal["plan"].as_u64().unwrap(), false).unwrap();
+    let clip = &after.sequence(state.active_sequence.unwrap()).unwrap().audio_tracks[0].items[0];
+    assert!(clip.duration.0 > 300 * filmcraft_engine::time::TICKS_PER_SECOND);
+    assert!(clip.effect("channel_router").is_none());
+    assert_eq!(workflow_volume(clip), 0.0);
+    s.execute("agent.apply", json!({"plan":proposal["plan"]})).unwrap();
+    assert_eq!(s.history.undo.len(), undo + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project, before);
+}

@@ -243,6 +243,19 @@ pub struct PrepareFootageParams {
     pub analyze: Option<bool>,
     /// Default true. Measure and normalize available audio to the resolved profile target.
     pub normalize_audio: Option<bool>,
+    /// Defaulttrue for talkingHead. Propose one-sided microphone repair after complete clip analysis.
+    pub repair_channels: Option<bool>,
+    /// Defaulttrue for talkingHead. Editable native EQ, multiband dynamics and peak limiting.
+    pub polish_voice: Option<bool>,
+    pub voice_tone: Option<super::audio::VoiceTone>,
+    #[schemars(range(min = 0, max = 1))]
+    pub voice_intensity: Option<f64>,
+    /// Extra native container streams: mute (default, retained for backup) or keep audible.
+    #[schemars(extend("enum"=["mute","keep",null]))]
+    pub secondary_audio: Option<String>,
+    /// Native source stream ordinal (zero based). Missing streams explicitly fall back to0.
+    #[schemars(range(min = 0, max = 63))]
+    pub main_audio_stream: Option<u32>,
     /// Default true for talkingHead; derives captions from available saved/local transcripts.
     pub captions: Option<bool>,
     /// Optional false only. Preparation never applies edits; review and approve the returned plan.
@@ -518,6 +531,12 @@ pub fn engine_params<T: serde::Serialize>(p: &T) -> Result<Value, crate::Automat
             "max_shots" => "maxShots",
             "target_duration_ticks" => "targetDurationTicks",
             "normalize_audio" => "normalizeAudio",
+            "repair_channels" => "repairChannels",
+            "polish_voice" => "polishVoice",
+            "voice_tone" => "voiceTone",
+            "voice_intensity" => "voiceIntensity",
+            "secondary_audio" => "secondaryAudio",
+            "main_audio_stream" => "mainAudioStream",
             "stride_frames" => "strideFrames",
             "max_frames" => "maxFrames",
             "black_threshold" => "blackThreshold",

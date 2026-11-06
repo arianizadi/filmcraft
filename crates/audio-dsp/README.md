@@ -48,6 +48,7 @@ id, name, range, default, `Unit`, log-scale hint and choice labels so UIs can be
 | `reverb` | 8×8 Householder FDN, pre-delay, RT60 decay, HF damping, size, mix |
 | `amplify`, `channel_volume`, `balance` | gain, per-channel gain, balance / constant-power pan |
 | `invert`, `swap_channels`, `fill_left`, `fill_right` | polarity and routing |
+| `channel_router` | stereo, either input to both outputs, mono average, swap, mid/side encode/decode, side to both; independent output gain/polarity, 5 ms per-sample smoothing |
 | `dehum` | 50/60 Hz notch comb with up to 10 harmonics |
 | `denoise` | STFT spectral gating, minimum-statistics noise floor (latency = FFT size) |
 | `pitch_shifter` | ±12 semitones, phase vocoder with peak shifting + phase locking (latency = FFT size) |
@@ -78,10 +79,37 @@ id, name, range, default, `Unit`, log-scale hint and choice labels so UIs can be
 | `ambisonics_panner` | rotates a ±30° source pair (pan/tilt/roll) and re-pans to stereo; identity at 0/0/0 |
 | `loudness_meter` | pass-through BS.1770 meter (`LoudnessMeterFx::meter`) |
 
+`channel_router` operates on the first two channels and preserves additional channels. A mono
+buffer remains mono and uses the left output gain/polarity; it never invents a missing source
+channel. Values above nominal full scale are preserved, allowing float recordings to be
+attenuated before integer delivery. Non-finite input samples become zero. The only saturation
+is at the finite `f32` representable limit. Mode indices and parameter ids are documented by
+`ChannelRouter::MODES` / `PARAMS`; `reset()` snaps the current targets for offline rendering.
+
 `AudioEffect::response_db(freq)` (EQs and filters) and `transfer_db(band, input_db)` (dynamics)
 expose the analytic curves for the graphical effect editors. Modulation effects start their LFO
 at the beginning of a chain, so a random-access render may differ in LFO phase from continuous
 playback.
+
+## Audio inspection (`inspect`)
+
+`Analyzer::new(channels)?` → `push(&[&[f32]])?` repeatedly → `report()`. Its bounded state
+retains no recording samples. Construction and reporting allocate at most 256 channel entries;
+`push` allocates nothing and caps each block at 1,048,576 aggregate channel samples. A malformed
+channel count, ragged block, oversized block or overflowing sample count fails before mutation.
+`with_options` validates thresholds; `reset` preserves those options while clearing measurements.
+
+Reports contain per-channel finite/non-finite counts, peak, RMS, centred AC RMS, DC, near-silent
+counts and `clipped_samples` (finite absolute amplitude ≥ 1). The latter means over nominal full
+scale; recoverable floating-point headroom is not proof of irreversible clipping. Missing data
+uses `None`, and non-finite values are counted and excluded from level measurements. Stereo
+statistics use finite pairs in the first two channels: centred Pearson correlation, mid/side
+RMS, difference RMS and mono power / stereo power. Zero mono power ratio indicates cancellation.
+
+Evidence is deliberately conservative: by default it needs at least 1024 frames, finite data,
+and AC signal above −60 dBFS. Silence is −80 dBFS. DC and weak recordings do not trigger channel
+repair suggestions. Left/right-only, dual-mono and inverted evidence requires exactly two
+channels. Low correlation is a measurement, not identification of unrelated speakers or sources.
 
 `effects::premiere_tests` checks every effect: neutral settings are (delayed) identity, output is
 deterministic and latency constant (impulse lands at `latency()`), plus a level / frequency-response

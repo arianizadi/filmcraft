@@ -4123,6 +4123,12 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::operations::commands());
     v.extend(crate::durable_jobs::commands());
     v.extend(crate::audio_jobs::commands());
+    v.extend(crate::audio_channels::commands());
+    v.extend(crate::audio_inspect::commands());
+    v.extend(crate::audio_mix::commands());
+    v.extend(crate::audio_output::commands());
+    v.extend(crate::audio_sync::commands());
+    v.extend(crate::audio_voice::commands());
     v.extend(crate::upscale::commands());
     v.extend(crate::motion_templates::commands());
     v.extend(crate::subject_tools::commands());
