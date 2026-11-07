@@ -59,6 +59,7 @@ const OP_LUMETRI_EXTRA:u32=37u;
 const OP_HSL_MASK:u32=38u;
 const OP_HSL_MEDIAN:u32=39u;
 const OP_HSL_COMBINE:u32=40u;
+const OP_LUT:u32=41u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -649,18 +650,90 @@ fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     return dec(v);
 }
 
+
+// LUT tables stay in GPU textures across frames: optional per-channel shaper, then red-fast cube.
+// Creative LUTs share their texture with the exact sampled curve tables after the LUT entries.
+fn lut_sizes() -> vec2<u32> {
+    if u.i0.x == OP_LUT { return u.i1.xy; }
+    return u.i1.yz;
+}
+fn lut_texel(index:u32) -> vec4<f32> {
+    let width=textureDimensions(aux).x;
+    return textureLoad(aux,vec2<i32>(i32(index%width),i32(index/width)),0);
+}
+fn lut_min1()->vec3<f32> { if u.i0.x==OP_LUT{return u.p0.xyz;}return u.p3.xyz; }
+fn lut_max1()->vec3<f32> { if u.i0.x==OP_LUT{return vec3(u.p0.w,u.p1.xy);}return vec3(u.p3.w,u.p4.xy); }
+fn lut_min3()->vec3<f32> { if u.i0.x==OP_LUT{return vec3(u.p1.zw,u.p2.x);}return vec3(u.p4.zw,u.p5.x); }
+fn lut_max3()->vec3<f32> { if u.i0.x==OP_LUT{return u.p2.yzw;}return u.p5.yzw; }
+fn lut_at(r: u32, g: u32, b: u32) -> vec3<f32> {
+    let n = lut_sizes().y;
+    return lut_texel(lut_sizes().x + r + g * n + b * n * n).xyz;
+}
+
+fn lut_tetra(c: vec3<f32>) -> vec3<f32> {
+    let n = lut_sizes().y;
+    let m = f32(n - 1u);
+    let t = clamp((c - lut_min3()) / (lut_max3() - lut_min3()), vec3(0.0), vec3(1.0)) * m;
+    let i = min(vec3<u32>(t), vec3(n - 2u));
+    let f = t - vec3<f32>(i);
+    let fr = f.x;
+    let fg = f.y;
+    let fb = f.z;
+    let c000 = lut_at(i.x, i.y, i.z);
+    let c111 = lut_at(i.x + 1u, i.y + 1u, i.z + 1u);
+    var ca: vec3<f32>;
+    var cb: vec3<f32>;
+    var w: vec4<f32>;
+    if (fr > fg) {
+        if (fg > fb) {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fr, fr - fg, fg - fb, fb);
+        } else if (fr > fb) {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fr, fr - fb, fb - fg, fg);
+        } else {
+            ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fb, fb - fr, fr - fg, fg);
+        }
+    } else if (fb > fg) {
+        ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fb, fb - fg, fg - fr, fr);
+    } else if (fb > fr) {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fg, fg - fb, fb - fr, fr);
+    } else {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fg, fg - fr, fr - fb, fb);
+    }
+    return w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
+}
+
+fn lut_apply(input:vec3<f32>)->vec3<f32> {
+    var c=clamp(input,vec3(0.0),vec3(1.0));
+    let sizes=lut_sizes();
+    if sizes.x>=2u {
+        let t=clamp((c-lut_min1())/(lut_max1()-lut_min1()),vec3(0.0),vec3(1.0))*f32(sizes.x-1u);
+        let i=min(vec3<u32>(t),vec3(sizes.x-2u));
+        let f=t-vec3<f32>(i);
+        for(var channel=0u;channel<3u;channel++) {
+            let a=lut_texel(i[channel])[channel];
+            let b=lut_texel(i[channel]+1u)[channel];
+            c[channel]=a+(b-a)*f[channel];
+        }
+    }
+    if sizes.y>=2u { c=lut_tetra(c); }
+    return c;
+}
+
 // The same 1024-entry tables sampled by effects::lumetri_advanced. The auxiliary texture
 // packs each scalar in Z, with 64 entries per row, exactly (no half-float quantization).
 fn grade_curve(table:u32,x:f32)->f32 {
     let p=clamp(x,0.0,1.0)*1023.0;
     let i=u32(p);let j=min(i+1u,1023u);
-    let a=table*1024u+i;let b=table*1024u+j;
-    let lo=textureLoad(aux,vec2<i32>(i32(a%64u),i32(a/64u)),0).z;
-    let hi=textureLoad(aux,vec2<i32>(i32(b%64u),i32(b/64u)),0).z;
+    let sizes=lut_sizes();let offset=sizes.x+sizes.y*sizes.y*sizes.y;
+    let a=offset+table*1024u+i;let b=offset+table*1024u+j;
+    let lo=lut_texel(a).z;
+    let hi=lut_texel(b).z;
     return lo+(hi-lo)*(p-f32(i));
 }
 fn lumetri_extra(c:vec3<f32>)->vec3<f32>{
     var v=enc(c);
+    let sizes=lut_sizes();
+    if sizes.x!=0u || sizes.y!=0u {v=v+(lut_apply(v)-v)*bitcast<f32>(u.i1.w);}
     let l=clamp(luma709(v),0.0,1.0);let sh=(1.0-l)*(1.0-l);let hi=l*l;let md=max(1.0-sh-hi,0.0);
     v+=(u.p0.xyz*0.3+vec3(u.p0.w*0.3))*sh;
     v+=(u.p1.xyz*0.3+vec3(u.p1.w*0.3))*md;
@@ -671,7 +744,7 @@ fn lumetri_extra(c:vec3<f32>)->vec3<f32>{
     if (bits&4u)!=0u {v.y=grade_curve(2u,v.y);}
     if (bits&8u)!=0u {v.z=grade_curve(3u,v.z);}
     if (bits&496u)!=0u {
-        var h=rgb_to_hsl(v);let h0=h.x;let s0=h.y;let l0=h.z;
+        var h=rgb_to_hsl(clamp(v,vec3(0.0),vec3(1.0)));let h0=h.x;let s0=h.y;let l0=h.z;
         if (bits&32u)!=0u {h.x=fract_euclid(h.x+(grade_curve(5u,h0)-0.5));}
         var sm=1.0;
         if (bits&16u)!=0u {sm*=grade_curve(4u,h0)*2.0;}
@@ -709,6 +782,7 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
         return bokeh(op, p);
     }
     switch op {
+        case OP_LUT:{let o=ld(p);if o.a<=1e-6{return o;}return vec4(dec(lut_apply(enc(o.rgb/o.a)))*o.a,o.a);}
         case OP_LUMETRI_EXTRA:{let o=ld(p);if o.a<=1e-6{return o;}return vec4(lumetri_extra(o.rgb/o.a)*o.a,o.a);}
         case OP_HSL_MASK:{let o=ld(p);var c=vec3(0.0);if o.a>1e-6{c=o.rgb/o.a;}let m=hsl_key_mask(c);return vec4(m,m,m,1.0);}
         case OP_HSL_MEDIAN:{

@@ -198,6 +198,7 @@ pub enum FxOp {
         warning_color: [f32; 3],
     },
     Lumetri {
+        input_lut: Option<std::sync::Arc<filmcraft_color::Lut>>,
         gains: [f32; 3],
         exposure: f32,
         contrast: f32,
@@ -593,7 +594,9 @@ impl FxOp {
                 let is_hdr = gs.is_hdr();
                 let has_input_lut = basic_on && !text(e, "input_lut").is_empty();
                 let has_look_lut = creative_on && !text(e, "look_lut").is_empty();
-                let look = if creative_on && !has_look_lut { choice(e, "look") } else { 0 };
+                let input_lut = if has_input_lut { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
+                let look_lut = if has_look_lut { crate::luts::resolve(cx.project, text(e, "look_lut")) } else { None };
+                let look = if creative_on && look_lut.is_none() { choice(e, "look") } else { 0 };
                 let sharpen = if creative_on { f(e, "sharpen", cx) / 100.0 } else { 0.0 };
 
                 let curves_on = on(e, "curves_on");
@@ -614,11 +617,11 @@ impl FxOp {
 
                 let hsl_on = b(e, "hsl_on");
 
-                let extra = (has_curves || has_wheels || hsl_on).then(|| Box::new(crate::lumetri_extra::LumetriExtra::eval(e, cx, w, h)));
+                let extra = (has_curves || has_wheels || hsl_on || has_look_lut).then(|| Box::new(crate::lumetri_extra::LumetriExtra::eval(e, cx, w, h)));
                 let gpu_capable = crate::lumetri_extra::valid_inputs(e)
                     && !is_hdr
-                    && !has_input_lut
-                    && !has_look_lut
+                    && (!has_input_lut || input_lut.as_ref().is_some_and(|lut| lut_gpu_ok(lut)))
+                    && (!has_look_lut || look_lut.is_some())
                     && look == 0
                     && sharpen.abs() <= 1e-3
                     && extra.as_ref().is_none_or(|v| v.gpu_ok());
@@ -645,6 +648,7 @@ impl FxOp {
                 let aspect = if h > 0 { (w as f32 / h as f32).max(1e-4) } else { 1.0 };
 
                 FxOp::Lumetri {
+                    input_lut,
                     gains,
                     exposure,
                     contrast,
@@ -715,8 +719,32 @@ impl FxOp {
             FxOp::AlphaAdjust { opacity, .. } => opacity.is_finite(),
             FxOp::Vignette { amount, midpoint, roundness, feather, target } => fin(&[*amount, *midpoint, *roundness, *feather]) && fin(target),
             FxOp::VideoLimiter { max, comp, axis, warning_color, .. } => *axis <= 3 && max.is_finite() && comp.is_finite() && fin(warning_color),
-            FxOp::Lumetri { gains, exposure, contrast, hl, sh, wh, bl, sat, faded, vib, st, ht, va, vmid, vround, vfeather, aspect, gpu_capable, .. } => {
+            FxOp::Lumetri {
+                input_lut,
+                gains,
+                exposure,
+                contrast,
+                hl,
+                sh,
+                wh,
+                bl,
+                sat,
+                faded,
+                vib,
+                st,
+                ht,
+                va,
+                vmid,
+                vround,
+                vfeather,
+                aspect,
+                gpu_capable,
+                extra,
+                ..
+            } => {
                 *gpu_capable
+                    && input_lut.as_ref().is_none_or(|lut| lut_gpu_ok(lut))
+                    && extra.as_ref().is_none_or(|extra| extra.gpu_ok())
                     && fin(gains)
                     && fin(&[*exposure, *contrast, *hl, *sh, *wh, *bl, *sat, *faded, *vib])
                     && fin(st)
@@ -1052,6 +1080,7 @@ impl FxOp {
                 });
             }
             FxOp::Lumetri {
+                input_lut,
                 gains,
                 exposure,
                 contrast,
@@ -1079,7 +1108,9 @@ impl FxOp {
                 let (creative_on, faded, vib, st, ht) = (*creative_on, *faded, *vib, *st, *ht);
                 let (vignette_on, va, vmid, vround, vfeather, aspect) = (*vignette_on, *va, *vmid, *vround, *vfeather, *aspect);
                 let (w, h) = (img.w as f32, img.h as f32);
+                let input_lut = input_lut.as_ref().filter(|lut| lut_is_valid(lut));
                 img.map_rgb(|c, x, y| {
+                    let c = input_lut.map_or(c, |lut| dec(lut.apply(enc(c).map(|v| v.clamp(0.0, 1.0)))));
                     // white balance + exposure in linear light
                     let lin = [c[0] * gains[0] * exposure, c[1] * gains[1] * exposure, c[2] * gains[2] * exposure];
                     let mut v = enc(lin);
@@ -1229,6 +1260,47 @@ fn resample_cpu(src: &Image, inv: &Affine, rect: [u32; 4]) -> Image {
         }
     });
     out
+}
+
+/// Maximum table texels accepted by the GPU path (16 MiB of RGBA32F). Larger LUTs retain the CPU renderer.
+pub const MAX_GPU_LUT_TEXELS: usize = 1_048_576;
+
+/// Validate immutable LUT tables before any GPU allocation or shader indexing.
+pub fn lut_gpu_ok(lut: &filmcraft_color::Lut) -> bool {
+    lut_texel_count(lut, true).is_some_and(|count| count <= MAX_GPU_LUT_TEXELS)
+}
+
+pub(crate) fn lut_is_valid(lut: &filmcraft_color::Lut) -> bool {
+    lut_texel_count(lut, false).is_some()
+}
+
+fn lut_texel_count(lut: &filmcraft_color::Lut, gpu: bool) -> Option<usize> {
+    let domain_ok = |lo: [f32; 3], hi: [f32; 3]| {
+        lo.iter().zip(hi).all(|(lo, hi)| {
+            lo.is_finite() && hi.is_finite() && hi > *lo && (!gpu || ((*lo == 0.0 || lo.is_normal()) && (hi == 0.0 || hi.is_normal()) && (hi - lo).is_normal()))
+        })
+    };
+    let mut count = 0usize;
+    if let Some(shaper) = &lut.shaper {
+        let size = shaper.data.len();
+        if !(2..=65_536).contains(&size) || !domain_ok(shaper.domain_min, shaper.domain_max) || !shaper.data.iter().flatten().all(|v| v.is_finite()) {
+            return None;
+        }
+        count = size;
+    }
+    if let Some(cube) = &lut.cube {
+        let size = cube.size.checked_pow(3)?;
+        if !(2..=256).contains(&cube.size)
+            || size != cube.data.len()
+            || !domain_ok(cube.domain_min, cube.domain_max)
+            || !cube.data.iter().flatten().all(|v| v.is_finite())
+        {
+            return None;
+        }
+        let total = count.checked_add(size)?;
+        count = total;
+    }
+    (count > 0).then_some(count)
 }
 
 #[cfg(test)]

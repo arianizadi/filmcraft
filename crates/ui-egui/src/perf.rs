@@ -39,6 +39,10 @@ pub fn stats(app: &FilmcraftApp) -> Value {
             "submitMs": g.last_ms,
         })
     });
+    // Process-wide effect work includes off-screen export compositors. A GPU-composited frame
+    // alone does not prove its LUT ran on the GPU: unsupported effects can arrive pre-rendered.
+    let (lut_dispatches, lut_uploads) = filmcraft_gpu::fx::lut_stats();
+    v["gpuEffects"] = json!({"lutDispatches": lut_dispatches, "lutTextureUploads": lut_uploads});
     // the Program monitor's picture against what is due: how far a drag or a scrub is ahead of it
     v["monitor"] = json!({
         "frame": app.program_picture().map(|k| k.frame),

@@ -74,3 +74,17 @@ CDL export and LUT baking return text by default. An optional output `path` publ
 file atomically and refuses an occupied destination. File outputs require Edit permission and stay
 outside staged plans. In-memory library edits and CDL import can be staged, previewed and applied
 as one revision-guarded undo step.
+
+## GPU LUT grading
+
+Export with `settings.gpuRendering:"auto"` to use the offscreen GPU compositor. SDR Lumetri input
+and creative LUTs now run in the effect stage, including 1D shapers, independent input domains,
+and exact tetrahedral 3D interpolation. Immutable tables remain uploaded across frames; creative
+looks retain their position before wheels, curves and HSL correction. The desktop app's
+`perf.stats.gpuEffects` reports actual LUT compute dispatches and texture uploads through its
+control channel or MCP bridge.
+
+The GPU table budget is 1,048,576 combined shaper/cube entries (16 MiB before curve tables),
+which covers 65³ camera LUTs. Larger tables, device texture limits, nonportable numerical domains,
+HDR grading and unsupported spatial effects retain the CPU renderer. GPU rendering remains an
+explicit export choice; hardware decoding and encoding are independent settings.

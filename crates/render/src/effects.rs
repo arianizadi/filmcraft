@@ -1332,7 +1332,14 @@ pub fn apply_look(look: u32, c: [f32; 3]) -> [f32; 3] {
 }
 
 pub(crate) fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+    let look_lut = if on(e, "creative_on") { crate::luts::resolve(cx.project, text(e, "look_lut")) } else { None };
+    lumetri_advanced_with_lut(img, e, cx, look_lut.as_deref());
+}
+
+/// Keep resolved project LUTs in evaluated operations, including their CPU fallback.
+pub(crate) fn lumetri_advanced_with_lut(img: &mut Image, e: &EffectInstance, cx: &FxCtx, look_lut: Option<&filmcraft_color::Lut>) {
     const N: usize = 1024;
+    let look_lut = look_lut.filter(|lut| crate::gpufx::lut_is_valid(lut));
     let (creative_on, curves_on, wheels_on) = (on(e, "creative_on"), on(e, "curves_on"), on(e, "wheels_on"));
     let lut = |id: &str| curve_param(e, id).filter(|c| curves_on && !is_identity_curve(c)).map(|c| curve_lut(&c, N));
     let (luma_c, red_c, green_c, blue_c) = (lut("curve_luma"), lut("curve_red"), lut("curve_green"), lut("curve_blue"));
@@ -1340,7 +1347,6 @@ pub(crate) fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) 
     let vs_sat = |id: &str| curve_param(e, id).filter(|_| curves_on).and_then(|c| vs_sat_lut(&c, N));
     let (hvs, hvh, hvl, lvs, svs) = (hue("hue_vs_sat"), hue("hue_vs_hue"), hue("hue_vs_luma"), vs_sat("luma_vs_sat"), vs_sat("sat_vs_sat"));
     // Creative ▸ Look: a LUT ("Browse…" / built-in) takes precedence over the procedural menu
-    let look_lut = if creative_on { crate::luts::resolve(cx.project, text(e, "look_lut")) } else { None };
     let look = if creative_on && look_lut.is_none() { choice(e, "look") } else { 0 };
     let look_k = f(e, "look_intensity", cx) / 100.0;
     let v2 = |id: &str| e.param(id).map(|p| p.vec2_at(cx.t)).unwrap_or_default();
@@ -1377,7 +1383,7 @@ pub(crate) fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) 
     };
     img.map_rgb(|c, _, _| {
         let mut v = gs.encode(c);
-        if let Some(l) = &look_lut {
+        if let Some(l) = look_lut {
             let lk = within_unit(v, hdr, |u| l.apply(u));
             v = [v[0] + (lk[0] - v[0]) * look_k, v[1] + (lk[1] - v[1]) * look_k, v[2] + (lk[2] - v[2]) * look_k];
         } else if look > 0 {
@@ -1873,5 +1879,80 @@ mod lumetri_cpu_parity_tests {
 
         let oval = render(-100.0);
         assert!(red(&oval, 79, 20) > red(&ellipse, 79, 20), "negative values widen the oval");
+    }
+}
+
+#[cfg(test)]
+mod lumetri_lut_cpu_parity_tests {
+    use super::*;
+    use crate::gpufx::FxOp;
+    use filmcraft_color::{Lut, Lut1d, Lut3d};
+    use filmcraft_project::{Project, ProjectLut, find_effect};
+
+    #[test]
+    fn evaluated_luts_match_original_lumetri_reference() {
+        let mut project = Project::new("LUT reference parity");
+        let mut shaper = Lut1d::identity(17);
+        shaper.domain_min = [-0.2, 0.1, -0.1];
+        shaper.domain_max = [1.1, 0.9, 1.3];
+        for (i, value) in shaper.data.iter_mut().enumerate() {
+            let x = i as f32 / 16.0;
+            *value = [x * x * 1.2 - 0.1, x.sqrt(), x * 0.8 + 0.1];
+        }
+        let input = Lut { title: String::new(), shaper: Some(shaper), cube: Some(Lut3d::from_fn(9, |c| [c[0] * c[1], c[1] * c[2], c[2] * c[0]])) };
+        let look = Lut::from_cube(Lut3d::from_fn(9, |c| [c[2] * 1.4 - 0.15, c[0].sqrt(), c[1] * 1.3]));
+        for (id, lut) in [("input", input), ("look", look)] {
+            project.luts.push(ProjectLut { id: id.into(), name: id.into(), source_path: None, format: "cube".into(), text: lut.to_cube().into() });
+        }
+        let context = FxCtx {
+            t: Tick::ZERO,
+            px_scale: 1.0,
+            seconds: 0.0,
+            timecode: "",
+            clip_name: "",
+            project: Some(&project),
+            env: None,
+            frame_rate: 24.0,
+            working: filmcraft_color::WorkingSpace::Rec709,
+        };
+        for basic in [true, false] {
+            for creative in [true, false] {
+                for intensity in [0.0, 37.0, 100.0, 150.0] {
+                    let mut e = find_effect("lumetri").unwrap().instance();
+                    for (id, value) in [
+                        ("input_lut", ParamValue::Text("lib:input".into())),
+                        ("look_lut", ParamValue::Text("lib:look".into())),
+                        ("basic_on", ParamValue::Bool(basic)),
+                        ("creative_on", ParamValue::Bool(creative)),
+                        ("exposure", ParamValue::Float(1.2)),
+                        ("shadows", ParamValue::Float(15.0)),
+                        ("look_intensity", ParamValue::Float(intensity)),
+                        ("wheel_midtones_l", ParamValue::Float(12.0)),
+                        ("curve_luma", ParamValue::Curve(vec![[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]])),
+                        ("hue_vs_sat", ParamValue::Curve(vec![[0.1, 0.7], [0.7, 0.2]])),
+                    ] {
+                        e.params.get_mut(id).unwrap().value = value;
+                    }
+                    let mut reference = Image::new(36, 20);
+                    for (i, pixel) in reference.px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let a = match i % 7 {
+                            0 => 0.0,
+                            1 => 0.0000001,
+                            2 => 0.3,
+                            _ => 1.0,
+                        };
+                        let c = [(i % 31) as f32 / 20.0, (i % 23) as f32 / 24.0, (i % 17) as f32 / 13.0];
+                        pixel.copy_from_slice(&[c[0] * a, c[1] * a, c[2] * a, a]);
+                    }
+                    let mut evaluated = reference.clone();
+                    lumetri(&mut reference, &e, &context);
+                    let op = FxOp::eval(&e, &context, evaluated.w, evaluated.h).unwrap();
+                    assert!(op.gpu_ok());
+                    op.apply(&mut evaluated);
+                    let worst = reference.px.iter().zip(&evaluated.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    assert!(worst < 2e-5, "basic={basic} creative={creative} intensity={intensity} max={worst}");
+                }
+            }
+        }
     }
 }

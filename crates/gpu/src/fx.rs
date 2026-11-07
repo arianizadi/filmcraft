@@ -12,7 +12,9 @@
 //! radii up to [`BOX_PER_PIXEL_MAX`] and as a running sum per row / column above, so a huge
 //! radius costs O(1) per pixel like on the CPU (radii are capped by `gaussian_boxes`).
 
+use filmcraft_color::Lut;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use filmcraft_render::gpufx::FxOp;
 use filmcraft_render::plan::LayerFx;
@@ -61,6 +63,18 @@ const OP_LUMETRI_EXTRA: u32 = 37;
 const OP_HSL_MASK: u32 = 38;
 const OP_HSL_MEDIAN: u32 = 39;
 const OP_HSL_COMBINE: u32 = 40;
+const OP_LUT: u32 = 41;
+const LUT_ROW: usize = 1024;
+
+static LUT_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LUT_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide counters for recorded LUT compute passes and immutable-table uploads.
+/// CPU-fallback layers do not increment these counters.
+pub fn lut_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (LUT_DISPATCHES.load(Ordering::Relaxed), LUT_UPLOADS.load(Ordering::Relaxed))
+}
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -72,11 +86,21 @@ pub(crate) struct FxStage {
     source: wgpu::RenderPipeline,
     pool: HashMap<(u32, u32), Vec<Target>>,
     used: HashSet<(u32, u32)>,
+    luts: HashMap<(usize, Vec<u32>), CachedLut>,
+    used_luts: HashSet<(usize, Vec<u32>)>,
+    lut_upload_count: u64,
+}
+
+struct CachedLut {
+    // Retain identity so allocator reuse cannot select stale textures.
+    _lut: Arc<Lut>,
+    view: wgpu::TextureView,
 }
 
 /// One compute pass of a job.
 struct Dispatch {
     run: bool,
+    lut: bool,
     bg: wgpu::BindGroup,
     groups: (u32, u32),
 }
@@ -105,6 +129,7 @@ struct Step {
     /// Bokeh Blur's gather: its kernel (`filmcraft_render::vfx::bokeh_kernel`), read as the aux
     /// texture.
     kernel: Vec<(i32, i32, f32)>,
+    lut: Option<Arc<Lut>>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -112,7 +137,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new() }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), lut: None }
 }
 
 /// Texels a row of a kernel texture holds.
@@ -263,6 +288,7 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             out.push(step(OP_VIDEO_LIMITER, [*axis, *warn as u32, 0, 0], &[*max, *comp, warning_color[0], warning_color[1], warning_color[2]]));
         }
         FxOp::Lumetri {
+            input_lut,
             gains,
             exposure,
             contrast,
@@ -285,6 +311,11 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             extra,
             ..
         } => {
+            if let Some(lut) = input_lut {
+                let mut input = step(OP_LUT, lut_sizes(lut), &lut_domains(lut));
+                input.lut = Some(lut.clone());
+                out.push(input);
+            }
             let ge = [gains[0] * exposure, gains[1] * exposure, gains[2] * exposure];
             let b0 = -bl * 0.15;
             let w0 = 1.0 - wh * 0.15;
@@ -323,13 +354,20 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
             if let Some(extra) = extra {
                 let bits = extra.curves.iter().enumerate().fold(0u32, |bits, (i, c)| bits | if c.is_empty() { 0 } else { 1 << i });
-                if bits != 0 || extra.wheels.iter().flatten().chain(&extra.lightness).any(|v| v.abs() > 1e-5) {
+                if extra.look_lut.is_some() || bits != 0 || extra.wheels.iter().flatten().chain(&extra.lightness).any(|v| v.abs() > 1e-5) {
                     let mut params = Vec::new();
                     for (wheel, l) in extra.wheels.iter().zip(extra.lightness) {
                         params.extend_from_slice(wheel);
                         params.push(l);
                     }
-                    let mut advanced = step(OP_LUMETRI_EXTRA, [bits, 0, 0, 0], &params);
+                    let mut i1 = [bits, 0, 0, 0];
+                    if let Some(lut) = &extra.look_lut {
+                        let sizes = lut_sizes(lut);
+                        i1 = [bits, sizes[0], sizes[1], extra.look_intensity.to_bits()];
+                        params.extend_from_slice(&lut_domains(lut));
+                    }
+                    let mut advanced = step(OP_LUMETRI_EXTRA, i1, &params);
+                    advanced.lut = extra.look_lut.clone();
                     if bits != 0 {
                         for curve in &extra.curves {
                             for i in 0..filmcraft_render::lumetri_extra::CURVE_SAMPLES {
@@ -364,7 +402,82 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
     out
 }
 
+fn lut_sizes(lut: &Lut) -> [u32; 4] {
+    [lut.shaper.as_ref().map_or(0, |s| s.data.len() as u32), lut.cube.as_ref().map_or(0, |c| c.size as u32), 0, 0]
+}
+
+fn lut_domains(lut: &Lut) -> [f32; 12] {
+    let (smin, smax) = lut.shaper.as_ref().map_or(([0.0; 3], [1.0; 3]), |s| (s.domain_min, s.domain_max));
+    let (cmin, cmax) = lut.cube.as_ref().map_or(([0.0; 3], [1.0; 3]), |c| (c.domain_min, c.domain_max));
+    [smin[0], smin[1], smin[2], smax[0], smax[1], smax[2], cmin[0], cmin[1], cmin[2], cmax[0], cmax[1], cmax[2]]
+}
+
+fn lut_texels(lut: &Lut, extra: usize) -> Option<usize> {
+    lut.shaper.as_ref().map_or(0, |s| s.data.len()).checked_add(lut.cube.as_ref().map_or(0, |c| c.data.len()))?.checked_add(extra)
+}
+
 impl FxStage {
+    /// Device-dependent preflight is shared by job creation and the compositor's CPU fallback.
+    pub(crate) fn supports_layer(device: &wgpu::Device, fx: &LayerFx) -> bool {
+        let max = device.limits().max_texture_dimension_2d;
+        if fx.size.0.max(fx.size.1) > max || !fx.ops.iter().all(FxOp::gpu_ok) {
+            return false;
+        }
+        fx.ops.iter().all(|op| {
+            let FxOp::Lumetri { input_lut, extra, .. } = op else { return true };
+            let look = extra.as_ref().and_then(|e| e.look_lut.as_ref());
+            input_lut.iter().chain(look).all(|lut| {
+                // Reserve all nine curve tables for a creative LUT: animated curves never change eligibility.
+                lut_texels(lut, 9 * filmcraft_render::lumetri_extra::CURVE_SAMPLES)
+                    .is_some_and(|count| LUT_ROW as u32 <= max && count.div_ceil(LUT_ROW) <= max as usize)
+            })
+        })
+    }
+
+    fn lut_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, lut: &Arc<Lut>, curves: &[(i32, i32, f32)]) -> Option<wgpu::TextureView> {
+        let key = (Arc::as_ptr(lut) as usize, curves.iter().map(|(_, _, value)| value.to_bits()).collect::<Vec<_>>());
+        self.used_luts.insert(key.clone());
+        if let Some(cached) = self.luts.get(&key) {
+            return Some(cached.view.clone());
+        }
+        let rows = lut_texels(lut, curves.len())?.div_ceil(LUT_ROW).max(1);
+        let count = rows.checked_mul(LUT_ROW)?;
+        let mut data = Vec::with_capacity(count.checked_mul(16)?);
+        for value in lut.shaper.iter().flat_map(|s| &s.data).chain(lut.cube.iter().flat_map(|c| &c.data)) {
+            for component in value.iter().chain(&[0.0]) {
+                data.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for (_, _, value) in curves {
+            for component in [0.0f32, 0.0, *value, 0.0] {
+                data.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        data.resize(count.checked_mul(16)?, 0);
+        let size = wgpu::Extent3d { width: LUT_ROW as u32, height: rows as u32, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("filmcraft-lumetri-lut"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some((LUT_ROW * 16) as u32), rows_per_image: Some(rows as u32) },
+            size,
+        );
+        let view = texture.create_view(&Default::default());
+        self.lut_upload_count = self.lut_upload_count.saturating_add(1);
+        LUT_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.luts.insert(key, CachedLut { _lut: lut.clone(), view: view.clone() });
+        Some(view)
+    }
+
     /// Whether `device` can run the stage: compute shaders with 16×16 workgroups and a storage
     /// texture (WebGL2-class devices can't; they render effects on the CPU).
     pub(crate) fn supported(device: &wgpu::Device) -> bool {
@@ -446,18 +559,35 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            bgl,
+            source,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+            luts: HashMap::new(),
+            used_luts: HashSet::new(),
+            lut_upload_count: 0,
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
     /// are released then.
     pub(crate) fn begin_frame(&mut self) {
         self.used.clear();
+        self.used_luts.clear();
     }
 
     pub(crate) fn end_frame(&mut self) {
         let used = &self.used;
         self.pool.retain(|k, _| used.contains(k));
+        self.luts.retain(|key, _| self.used_luts.contains(key));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lut_upload_count(&self) -> u64 {
+        self.lut_upload_count
     }
 
     /// No working textures held.
@@ -502,8 +632,7 @@ impl FxStage {
         dummy: &wgpu::TextureView,
     ) -> Option<FxJob> {
         let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
-        let max = device.limits().max_texture_dimension_2d;
-        if w > max || h > max {
+        if !Self::supports_layer(device, fx) {
             return None;
         }
         let all: Vec<Step> = fx.ops.iter().flat_map(|op| steps(op, w, h)).collect();
@@ -521,7 +650,11 @@ impl FxStage {
             }
             let keep = if s.unsharp_blur || s.combine { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let kernel = (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel));
+            let kernel = if let Some(lut) = &s.lut {
+                Some(self.lut_texture(device, queue, lut, &s.kernel)?)
+            } else {
+                (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel))
+            };
             let aux = match (s.combine, orig, &kernel) {
                 (true, Some(o), _) => views.get(o)?,
                 (_, _, Some(k)) => k,
@@ -557,7 +690,7 @@ impl FxStage {
             } else {
                 (w.div_ceil(16), h.div_ceil(16))
             };
-            dispatches.push(Dispatch { run: s.run, bg, groups });
+            dispatches.push(Dispatch { run: s.run, lut: s.lut.is_some(), bg, groups });
             cur = dst;
             if s.combine {
                 orig = None;
@@ -600,6 +733,9 @@ impl FxStage {
             pass.set_pipeline(if d.run { &self.run } else { &self.px });
             pass.set_bind_group(0, &d.bg, &[]);
             pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
+            if d.lut {
+                LUT_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }

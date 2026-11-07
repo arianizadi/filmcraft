@@ -756,12 +756,11 @@ impl GpuCompositor {
         let out_view = Self::target(&self.device, &mut self.output, w, h, OUTPUT_FORMAT, wgpu::TextureUsages::COPY_SRC);
         // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
         // larger than a texture) are rendered on the CPU here and drawn as plain RGBA layers.
-        let max_side = self.device.limits().max_texture_dimension_2d;
         let cpu_fx: Vec<Option<PlanLayer>> = layers
             .iter()
             .map(|l| {
                 let lfx = l.fx.as_ref()?;
-                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
+                if self.fx.is_some() && fx::FxStage::supports_layer(&self.device, lfx) {
                     return None;
                 }
                 let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
@@ -834,21 +833,18 @@ impl GpuCompositor {
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None => {
-                    // (a layer with effects only gets here if its job failed, which the CPU
-                    // fallback above rules out; it is then drawn without them, where the working
-                    // image would be)
-                    let m = match &l.fx {
-                        Some(lfx) => {
-                            let n = 1.0 / lfx.decimation.max(1) as f64;
-                            l.matrix.then_apply(&filmcraft_geom::Affine::scale(n, n)).then_apply(&filmcraft_render::plan::quarter_turns(
-                                lfx.turns,
-                                l.frame.width as f64,
-                                l.frame.height as f64,
-                            ))
-                        }
-                        None => l.matrix,
-                    };
-                    (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
+                    if let Some(lfx) = &l.fx {
+                        // A failed GPU job must retain every effect, even when a resource preflight
+                        // or future routing change refuses a layer after the initial CPU selection.
+                        let image = filmcraft_render::plan::effect_image(&l.frame, lfx);
+                        let frame = VideoFrame::rgba_f32(image.w as u32, image.h as u32, image.px);
+                        let key = self.upload(&frame, None);
+                        let source = self.src_info(&frame, key).unwrap_or(src);
+                        let fallback_views = self.uploads.get(&key).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
+                        (Self::uniforms(&source, &l.matrix, l.opacity, l.blend, (w, h)), fallback_views)
+                    } else {
+                        (Self::uniforms(&src, &l.matrix, l.opacity, l.blend, (w, h)), views)
+                    }
                 }
             };
             jobs.push(job);

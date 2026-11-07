@@ -952,3 +952,145 @@ fn effect_source_integer_decimation_preserves_cpu_box_oracle() {
         }
     }
 }
+
+#[test]
+fn lumetri_custom_luts_match_cpu_on_gpu() {
+    use filmcraft_color::{Lut, Lut1d, Lut3d};
+    use filmcraft_project::{Project, ProjectLut};
+    let instance = crate::adapter::native_instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+        eprintln!("no GPU adapter; skipping LUT parity");
+        return;
+    };
+    let info = adapter.get_info();
+    eprintln!("LUT parity adapter: {} ({:?})", info.name, info.backend);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("LUT parity GPU device");
+    let mut compositor = GpuCompositor::new(&device, &queue);
+    let (w, h) = (80, 48);
+    let pixels = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, pixels.clone());
+    let nonlinear = |c: [f32; 3]| [c[0] * c[1] * 1.2 - 0.05, c[1] * c[2], c[2] * c[0] * 1.3];
+    let mut shaper = Lut1d::identity(33);
+    shaper.domain_min = [-0.2, 0.1, -0.1];
+    shaper.domain_max = [1.2, 0.9, 1.1];
+    for (i, value) in shaper.data.iter_mut().enumerate() {
+        let x = i as f32 / 32.0;
+        *value = [x * x * 1.3 - 0.1, x.sqrt(), x * 0.9 + 0.1];
+    }
+    let mut domain_cube = Lut3d::from_fn(9, nonlinear);
+    domain_cube.domain_min = [-0.1; 3];
+    domain_cube.domain_max = [1.2; 3];
+    let cases = [
+        Lut::from_cube(Lut3d::from_fn(65, nonlinear)),
+        Lut { title: String::new(), shaper: Some(shaper.clone()), cube: None },
+        Lut { title: String::new(), shaper: Some(shaper), cube: Some(domain_cube) },
+    ];
+    let before_stats = crate::fx::lut_stats();
+    for (index, input) in cases.into_iter().enumerate() {
+        let mut project = Project::new("GPU LUT parity");
+        let look = Lut::from_cube(Lut3d::from_fn(7, |c| [c[2] * 1.5 - 0.2, c[0].sqrt(), c[1] * 1.3]));
+        for (id, lut) in [("input", input), ("look", look)] {
+            project.luts.push(ProjectLut { id: id.into(), name: id.into(), source_path: None, format: "cube".into(), text: lut.to_cube().into() });
+        }
+        let context = FxCtx { project: Some(&project), ..cx(Tick::ZERO, 1.0) };
+        for intensity in [0.0, 37.0, 100.0, 150.0] {
+            let e = effect(
+                "lumetri",
+                &[
+                    ("input_lut", ParamValue::Text("lib:input".into())),
+                    ("look_lut", ParamValue::Text("lib:look".into())),
+                    ("look_intensity", fl(intensity)),
+                    ("exposure", fl(1.4)),
+                    ("highlights", fl(-40.0)),
+                    ("saturation", fl(92.0)),
+                    ("wheel_midtones_l", fl(12.0)),
+                    ("curve_luma", ParamValue::Curve(vec![[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]])),
+                    ("hue_vs_sat", ParamValue::Curve(vec![[0.1, 0.7], [0.7, 0.2]])),
+                ],
+            );
+            let op = FxOp::eval(&e, &context, w as usize, h as usize).unwrap();
+            assert!(op.gpu_ok());
+            let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: pixels.clone() };
+            op.apply(&mut cpu);
+            let layer_fx = LayerFx { size: (w, h), decimation: 1, turns: 0, ops: vec![op] };
+            let (_, _, gpu) = compositor.effect_image(&frame, &layer_fx).expect("GPU LUT effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            assert!(worst < EXACT && flips == 0.0, "LUT case {index}, intensity {intensity}: {worst} flips {flips}");
+            let upload_count = compositor.fx.as_ref().unwrap().lut_upload_count();
+            compositor.effect_image(&frame, &layer_fx).expect("cached GPU LUT effect image");
+            assert_eq!(compositor.fx.as_ref().unwrap().lut_upload_count(), upload_count, "static LUTs must stay uploaded across frames");
+        }
+    }
+    let after_stats = crate::fx::lut_stats();
+    assert!(after_stats.0 >= before_stats.0 + 48, "input and creative shader passes must actually dispatch");
+}
+
+#[test]
+fn lumetri_lut_hostile_tables_and_device_limits_keep_cpu_fallback() {
+    use filmcraft_color::{Lut, Lut3d};
+    use filmcraft_render::gpufx::lut_gpu_ok;
+    let valid = Lut::from_cube(Lut3d::identity(2));
+    assert!(lut_gpu_ok(&valid));
+    for size in [0, 1, usize::MAX] {
+        let mut invalid = valid.clone();
+        invalid.cube.as_mut().unwrap().size = size;
+        assert!(!lut_gpu_ok(&invalid));
+    }
+    let mut invalid = valid.clone();
+    invalid.cube.as_mut().unwrap().data.pop();
+    assert!(!lut_gpu_ok(&invalid));
+    let mut invalid = valid.clone();
+    invalid.cube.as_mut().unwrap().domain_max[1] = 0.0;
+    assert!(!lut_gpu_ok(&invalid));
+    let mut invalid = valid.clone();
+    invalid.cube.as_mut().unwrap().domain_max[1] = f32::from_bits(1);
+    assert!(!lut_gpu_ok(&invalid), "subnormal spans retain the CPU path because GPU math may flush them to zero");
+    let mut invalid = valid.clone();
+    invalid.cube.as_mut().unwrap().data[0][0] = f32::NAN;
+    assert!(!lut_gpu_ok(&invalid));
+    let mut invalid = valid;
+    invalid.cube.as_mut().unwrap().domain_min[0] = -f32::MAX;
+    invalid.cube.as_mut().unwrap().domain_max[0] = f32::MAX;
+    assert!(!lut_gpu_ok(&invalid));
+    assert!(!lut_gpu_ok(&Lut::from_cube(Lut3d::identity(129))), "large tables must retain bounded CPU fallback");
+}
+
+#[test]
+fn lumetri_lut_small_device_compositor_preserves_cpu_effects() {
+    use filmcraft_color::{Lut, Lut3d};
+    use filmcraft_project::{Project, ProjectLut};
+    let instance = crate::adapter::native_instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let limits = wgpu::Limits { max_texture_dimension_2d: 512, ..Default::default() };
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).expect("limited GPU device");
+    assert_eq!(device.limits().max_texture_dimension_2d, 512);
+    let mut compositor = GpuCompositor::new(&device, &queue);
+    let mut project = Project::new("limited device fallback");
+    project.luts.push(ProjectLut {
+        id: "swap".into(),
+        name: "swap".into(),
+        source_path: None,
+        format: "cube".into(),
+        text: Lut::from_cube(Lut3d::from_fn(2, |c| [c[2], c[0], c[1]])).to_cube().into(),
+    });
+    let e = effect("lumetri", &[("input_lut", ParamValue::Text("lib:swap".into())), ("exposure", fl(0.2))]);
+    let context = FxCtx { project: Some(&project), ..cx(Tick::ZERO, 1.0) };
+    let op = FxOp::eval(&e, &context, 8, 8).unwrap();
+    assert!(op.gpu_ok(), "the LUT is valid, but this device cannot fit its upload table");
+    let fx = LayerFx { size: (8, 8), decimation: 1, turns: 0, ops: vec![op] };
+    assert!(!crate::fx::FxStage::supports_layer(&device, &fx));
+    let frame = Arc::new(VideoFrame::rgba_f32(8, 8, [0.1, 0.2, 0.5, 1.0].repeat(64)));
+    let mut layer = PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal);
+    layer.fx = Some(Arc::new(fx));
+    let plan = FramePlan::Layers { width: 8, height: 8, layers: vec![layer] };
+    let cpu = execute_cpu(&plan);
+    compositor.composite(&plan);
+    let gpu = super::blend_tests::read_accum(&compositor);
+    let worst = cpu.px.iter().zip(gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 1e-3, "device fallback dropped or changed effects: {worst}");
+    assert_eq!(compositor.fx.as_ref().unwrap().lut_upload_count(), 0);
+}

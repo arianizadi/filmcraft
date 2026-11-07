@@ -23,6 +23,8 @@ pub struct LumetriExtra {
     pub wheels: [[f32; 3]; 3],
     pub lightness: [f32; 3],
     pub hsl: Option<HslSecondary>,
+    pub look_lut: Option<std::sync::Arc<filmcraft_color::Lut>>,
+    pub look_intensity: f32,
     effect: EffectInstance,
     time: filmcraft_time::Tick,
     scale: f32,
@@ -90,7 +92,9 @@ impl LumetriExtra {
                 blur_y,
             }
         });
-        Self { curves, wheels, lightness, hsl, effect: e.clone(), time: cx.t, scale: cx.px_scale, working: cx.working, valid }
+        let look_lut = if on(e, "creative_on") { crate::luts::resolve(cx.project, crate::effects::text(e, "look_lut")) } else { None };
+        let look_intensity = f(e, "look_intensity", cx) / 100.0;
+        Self { curves, wheels, lightness, hsl, look_lut, look_intensity, effect: e.clone(), time: cx.t, scale: cx.px_scale, working: cx.working, valid }
     }
     pub fn gpu_ok(&self) -> bool {
         let finite = |values: &[f32]| values.iter().all(|v| v.is_finite());
@@ -99,6 +103,8 @@ impl LumetriExtra {
             && self.curves.iter().all(|v| (v.is_empty() || v.len() == CURVE_SAMPLES) && finite(v))
             && self.wheels.iter().all(|v| finite(v))
             && finite(&self.lightness)
+            && self.look_intensity.is_finite()
+            && self.look_lut.as_ref().is_none_or(|lut| crate::gpufx::lut_gpu_ok(lut))
             && self.hsl.as_ref().is_none_or(|h| finite(&h.key) && finite(&h.correction) && h.denoise.is_finite() && h.median_radius <= 3 && h.show <= 3)
     }
     pub(crate) fn apply(&self, image: &mut crate::Image) {
@@ -113,7 +119,7 @@ impl LumetriExtra {
             frame_rate: 24.0,
             working: self.working,
         };
-        crate::effects::lumetri_advanced(image, &self.effect, &cx);
+        crate::effects::lumetri_advanced_with_lut(image, &self.effect, &cx, self.look_lut.as_deref());
         crate::effects::hsl_secondary(image, &self.effect, &cx);
     }
 }
